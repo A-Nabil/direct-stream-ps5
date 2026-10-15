@@ -106,6 +106,9 @@ def valid_folder(value):
     return posixpath.normpath(value)
 
 
+URL_SAFE = "/%:@!$&'()*+,;=-._~"
+
+
 def valid_url(value):
     value = safe_text(value, "download URL", 16384)
     try:
@@ -113,9 +116,16 @@ def valid_url(value):
         if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
             raise ValueError()
         _ = p.port
+        # Percent-encode spaces and other unsafe characters (existing %XX is kept)
+        # so names like "Game (USA) v1.pkg" don't make http.client reject the request.
+        value = urllib.parse.urlunsplit((
+            p.scheme, p.netloc,
+            urllib.parse.quote(p.path, safe=URL_SAFE),
+            urllib.parse.quote(p.query, safe=URL_SAFE + "?"),
+            p.fragment))
         value.encode("ascii")
     except (ValueError, UnicodeError):
-        raise TransferError("Use an HTTP or HTTPS direct link (URL-encode spaces and non-ASCII characters).")
+        raise TransferError("Use an HTTP or HTTPS direct link.")
     return value
 
 

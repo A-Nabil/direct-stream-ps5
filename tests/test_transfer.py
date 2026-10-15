@@ -12,7 +12,7 @@ import time
 import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from transfer_core import (MIB, Meter, StopToken, TransferError, make_reader, probe_source,
-    transfer, valid_name, valid_folder, check_ftp_storage, validate_source_url, connect_ftp, close_ftp)
+    transfer, valid_url, valid_name, valid_folder, check_ftp_storage, validate_source_url, connect_ftp, close_ftp)
 from ps5_streamer import Manager, Handler, validated_settings
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
@@ -288,5 +288,18 @@ class Integration(unittest.TestCase):
             j3 = next(j for j in m.jobs if "custom.bin" in j["name"])
             self.assertEqual(j3.get("folder"), "/data/custom_dir")
             m.stop()
+
+class ValidUrl(unittest.TestCase):
+    def test_spaces_encoded_parens_kept(self):
+        self.assertEqual(valid_url("http://h/a b/Game (USA) v1.pkg?x=1 2"),
+                         "http://h/a%20b/Game%20(USA)%20v1.pkg?x=1%202")
+
+    def test_existing_encoding_untouched(self):
+        u = "https://h/Game%20(USA).pkg?a=b%26c"
+        self.assertEqual(valid_url(u), u)
+
+    def test_rejects_bad_scheme(self):
+        with self.assertRaises(TransferError):
+            valid_url("ftp://h/f")
 
 if __name__=='__main__':unittest.main()
