@@ -1177,6 +1177,21 @@ function render(s) {
     etaText = duration(m.eta);
   }
 
+  // The headline speed belongs to whichever leg is actually moving. During a
+  // disk-buffer download nothing is uploading yet, so showing upload_bps there
+  // reads "0.0 MB/s" while the source is pouring in at full speed.
+  const headActive = (state.jobs || []).find(j => j.id === state.active);
+  const headDownloading = !!(headActive && headActive.disk_buffer
+                             && !(headActive.transferred > 0)
+                             && headActive.state !== 'completed');
+  if (headDownloading) {
+    upVal = m.download_bps != null ? (m.download_bps / 1e6).toFixed(1) : '0.0';
+    upUnit = ' MB/s';
+  }
+  if ($('speed-leg-label')) {
+    $('speed-leg-label').textContent = headActive
+      ? (headDownloading ? 'From source ' : 'To console ') : '';
+  }
   if ($('upload-speed')) $('upload-speed').textContent = upVal;
   if ($('upload-speed-unit')) $('upload-speed-unit').textContent = upUnit;
   if ($('upload-speed-display')) $('upload-speed-display').textContent = consoleVal;

@@ -314,7 +314,7 @@ class Manager:
 
     def _load(self):
         try:
-            state = json.loads(self.path.read_text())
+            state = json.loads(self.path.read_text(encoding="utf-8"))
             self.settings = validated_settings(state.get("settings", {}))
             self.settings.pop("password", None)
             self.jobs = state.get("jobs", [])
@@ -338,7 +338,7 @@ class Manager:
         except FileNotFoundError:
             if self.directory == Path.home() / ".ps5-transfer":
                 try:
-                    old = json.loads((Path.home() / ".ps5_streamer.json").read_text())
+                    old = json.loads((Path.home() / ".ps5_streamer.json").read_text(encoding="utf-8"))
                     self.settings.update({"host": str(old.get("ip", "")), "port": int(old.get("port", 1337)),
                                           "folder": old.get("dir", DEFAULTS["folder"])})
                     self.settings = validated_settings(self.settings)
@@ -384,8 +384,17 @@ class Manager:
     def configure(self, raw):
         cfg = validated_settings(raw)
         with self.lock:
-            if self.current or self.diagnostic["state"] == "running":
-                raise TransferError("Pause transfers and finish diagnostics before changing settings.")
+            if self.diagnostic["state"] == "running":
+                raise TransferError("Finish the diagnostic before changing settings.")
+            if self.current:
+                active = next((j for j in self.jobs if j["id"] == self.current), None)
+                # A disk-buffer job that has not started uploading is not touching the
+                # console at all, so its address can still be changed.
+                downloading_only = bool(active and active.get("disk_buffer")
+                                        and not active.get("transferred"))
+                if not downloading_only:
+                    raise TransferError(
+                        "Pause the transfer before changing settings.")
             new_password = cfg.pop("password")
             if "password" in raw:
                 self.password = new_password
@@ -569,7 +578,10 @@ class Manager:
                     is_arch = is_archive_candidate(name) or is_archive_candidate(src)
                     job_extract_mode = data.get("extract_mode") or (self.settings.get("extract_mode", "ps5") if is_arch else "none")
                     is_decomp = bool(data.get("decompress", True)) and job_extract_mode != "none"
-                    archive_pwd = data.get("archive_password") or extract_password_hint(src) or extract_password_hint(name) or ""
+                    user_pwd = data.get("archive_password") or ""
+                    guessed_pwd = extract_password_hint(src) or extract_password_hint(name) or ""
+                    archive_pwd = user_pwd or guessed_pwd
+                    pwd_was_guessed = bool(not user_pwd and guessed_pwd)
                     is_enc = bool(archive_pwd or data.get("archive_encrypted"))
                     staged_ext = (job_extract_mode == "mac") or bool(data.get("staged_extraction", False))
                     if is_enc and not staged_ext and not find_unrar_ps5_payload():
@@ -631,6 +643,7 @@ class Manager:
                         "extract_mode": job_extract_mode,
                         "archive_encrypted": is_enc,
                         "archive_password": archive_pwd,
+                        "archive_password_guessed": pwd_was_guessed,
                         "staged_extraction": staged_ext,
                         "unrar_extract_location": data.get("unrar_extract_location") or self.settings.get("unrar_extract_location", "/data/homebrew"),
                         "unrar_delete_after": bool(data.get("unrar_delete_after", self.settings.get("unrar_delete_after", True))),
@@ -822,18 +835,23 @@ class Manager:
                         or "Found a partial file without source history" in str((job.get("error_info") or {}).get("message", ""))
                     )
                     if action == "restart" or (action == "resume" and is_unowned_error):
-                        # New partial path; never delete a potentially valuable old partial silently.
-                        if job.get("cache_dir"):
-                            shutil.rmtree(job["cache_dir"], ignore_errors=True)
-                            job["cache_dir"] = ""
-                            job["dl_transferred"] = 0
+                        # New partial path; never delete a potentially valuable old partial
+                        # silently. The downloaded cache is deliberately KEPT: those bytes
+                        # are valid whatever the destination, and re-fetching tens of GB to
+                        # change a folder would be absurd. A changed source is caught by the
+                        # cache's own identity check instead.
                         job["id"] = secrets.token_hex(6)
                         job["identity"] = None
                         job["stage_owned"] = False
                         job["transferred"] = 0
                         job["destination"] = None
                     job["state"] = "queued"
-                    job["detail"] = "Queued to resume" if action == "resume" and not is_unowned_error else "Queued to restart from zero; old partial retained"
+                    if action == "resume" and not is_unowned_error:
+                        job["detail"] = "Queued to resume"
+                    elif job.get("cache_dir"):
+                        job["detail"] = "Queued to restart the send; downloaded data kept"
+                    else:
+                        job["detail"] = "Queued to restart from zero; old partial retained"
                 elif action == "toggle_disk_buffer":
                     if job["id"] == self.current:
                         raise TransferError("Pause the transfer before changing download mode.")
@@ -924,17 +942,31 @@ class Manager:
                         raise TransferError("Pause the transfer before updating password.")
                     pwd = (extra or {}).get("password", "")
                     job["archive_password"] = pwd if pwd else None
+                    job["archive_password_guessed"] = False
                     if pwd:
                         job["archive_encrypted"] = True
-                        job["staged_extraction"] = True
                         job["decompress"] = True
+                        # An encrypted archive needs local staging ONLY when the console
+                        # cannot do it: unrar-ps5 takes archive_password in its config.
+                        # Forcing it otherwise moves an on-console job onto this PC
+                        # behind the user's back (and re-stages an already-sent archive).
+                        if (str(job.get("extract_mode") or "").lower() != "ps5"
+                                or not find_unrar_ps5_payload()):
+                            job["staged_extraction"] = True
                         if job["state"] in ("failed", "paused"):
                             job["state"] = "queued"
                             job["detail"] = "Password configured · Queued for transfer"
                         else:
                             job["detail"] = "Password configured"
                     else:
-                        job["detail"] = "Password cleared"
+                        # Clearing is just as much a fix as setting: an archive with no
+                        # password fails until the guessed one is removed, so re-queue
+                        # the job either way instead of leaving it sitting on failed.
+                        if job["state"] in ("failed", "paused"):
+                            job["state"] = "queued"
+                            job["detail"] = "Password cleared · Queued to retry"
+                        else:
+                            job["detail"] = "Password cleared"
                 elif action == "set_extract_mode":
                     if job["id"] == self.current:
                         raise TransferError("Pause the transfer before changing extraction settings.")
@@ -1241,8 +1273,14 @@ class Manager:
                     self.running = False
                     continue
                 cfg = {**self.settings, "password": self.password,
-                       "_ftp_lock": self.ftp_lock, "_data_dir": str(self.directory)}
-                destination = {k: cfg[k] for k in ("host", "port", "folder", "username")}
+                       "_ftp_lock": self.ftp_lock, "_data_dir": str(self.directory),
+                       "_live_settings": (lambda: {**self.settings,
+                                                   "password": self.password})}
+                # Compare against the folder this job actually targets. Recording the
+                # global folder made any job with its own destination (e.g. /mnt/usb0)
+                # fail as soon as the global default changed, which it never relied on.
+                destination = {k: cfg[k] for k in ("host", "port", "username")}
+                destination["folder"] = job.get("folder") or cfg["folder"]
                 if job.get("destination") and job["destination"] != destination:
                     job["state"] = "failed"
                     job["detail"] = "PS5 destination changed. Restore the original settings to resume, or Restart for this destination."
@@ -1766,7 +1804,7 @@ def main():
     lockfile = _lock_instance(directory)
     if lockfile is None:
         try:
-            session = json.loads((directory / "session.json").read_text())
+            session = json.loads((directory / "session.json").read_text(encoding="utf-8"))
             if not args.no_browser:
                 open_browser(session["url"])
             print("DIRECT STREAM FOR PLAYSTATION 5 is already running.", flush=True)

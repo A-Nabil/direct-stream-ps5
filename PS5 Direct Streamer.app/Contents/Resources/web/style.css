@@ -2352,6 +2352,15 @@ a { color: inherit; text-decoration: none; }
    Each leg of the journey states its own case: where it runs, what it is doing
    right now, how far along it is. Two bare tracks were ambiguous; a track that
    names itself is not. */
+.speed-leg-label {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-right: 6px;
+}
+
 .phase-stack {
   display: flex;
   flex-direction: column;

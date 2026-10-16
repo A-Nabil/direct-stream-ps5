@@ -1596,6 +1596,39 @@ def send_ps5_payload(host, port=9021, elf_path=None, elf_bytes=None, timeout=10)
     return True
 
 
+UNRAR_EXIT_CODES = {
+    0: "success",
+    1: "finished with warnings",
+    2: "a fatal error occurred",
+    3: "checksum error — the uploaded archive is damaged or incomplete",
+    4: "the archive is locked",
+    5: "the console could not write the extracted files (disk full or read-only?)",
+    6: "the console could not open the archive",
+    7: "the payload was given bad options",
+    8: "the console ran out of memory",
+    9: "the console could not create the output files",
+    10: "no files matched inside the archive",
+    11: "wrong archive password",
+}
+
+
+def describe_unrar_failure(code, reason=""):
+    """Turn an unrar exit code into something the user can act on."""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = -1
+    meaning = UNRAR_EXIT_CODES.get(code)
+    if code == 11:
+        return ("PS5 extraction failed: wrong archive password. Enter the correct "
+                "password on this transfer and resume it — the archive is still on the "
+                "console, so nothing is downloaded or uploaded again; only the "
+                "extraction is retried.")
+    if meaning:
+        return f"PS5 extraction failed: {meaning} (unrar code {code})."
+    return f"PS5 extraction failed (code={code}, reason={reason or 'unknown'})."
+
+
 def generate_unrar_config(filename="", archive_location="/data/unrar", extract_location="/data/homebrew",
                           password=None, delete_after=True, progress=10, threads=0, nice=-20, cpu_mask=0):
     """Generates the config.ini content for bizkut/unrar-ps5."""
@@ -2275,11 +2308,18 @@ def stream_file_to_ftp(ftp, source, name, job, settings, token, report, save,
     return expected
 
 
-def transfer_ps5_remote_archive(job, settings, token, report, save):
+def transfer_ps5_remote_archive(job, settings, token, report, save,
+                                source_override=None, size_override=None):
     """Streams single or multipart compressed archives directly to the PS5 internal SSD
     at /data/unrar/[filename] over FTP (using exactly 0 GB of Mac disk space),
     writes the /data/unrar/config.ini configuration file, and triggers the unrar_ps5.elf
-    payload injection to the PS5 payload loader port (default 9021) for high-speed on-console extraction."""
+    payload injection to the PS5 payload loader port (default 9021) for high-speed on-console extraction.
+
+    source_override lets disk-buffer mode feed a still-growing local cache file in place
+    of probing the URL, so the archive can upload while it is still downloading. What
+    lands on the console is the raw archive either way; extraction only runs afterwards.
+    size_override supplies the eventual size for the storage preflight, which cannot be
+    read from a file that has not finished downloading."""
     ftp = None
     clean = False
     meter = Meter()
@@ -2328,12 +2368,15 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
         total_size = sum((item["info"].size or 0) for item in files_to_upload)
     else:
         raw_kind = job.get("kind", "url")
-        raw_src = probe_source(raw_kind, job["source"], token, decompress=False)
-        if raw_src.kind == "url" and raw_src.location != job.get("source"):
-            job["source"] = raw_src.location
+        if source_override is not None:
+            raw_src = source_override
+        else:
+            raw_src = probe_source(raw_kind, job["source"], token, decompress=False)
+            if raw_src.kind == "url" and raw_src.location != job.get("source"):
+                job["source"] = raw_src.location
         archive_name = valid_name(raw_src.filename or job.get("name") or "archive.bin")
         primary_archive_name = archive_name
-        total_size = raw_src.size
+        total_size = size_override or raw_src.size
         files_to_upload.append({"name": archive_name, "info": raw_src, "kind": raw_kind, "source": job["source"]})
 
     job["total"] = total_size
@@ -2505,7 +2548,7 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
                             else:
                                 extract_done = True
                                 extract_failed = True
-                                failure_reason = f"Extraction failed (code={code}, reason={reason})"
+                                failure_reason = describe_unrar_failure(code, reason)
                             break
 
                         # Already installed check
@@ -2619,14 +2662,20 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
                                 reason = m_reason.group(1) if m_reason else "unknown"
                                 if int(m_code.group(1)) != 0 and reason != "success":
                                     extract_failed = True
-                                    failure_reason = (f"Extraction failed "
-                                                      f"(code={m_code.group(1)}, reason={reason})")
+                                    failure_reason = describe_unrar_failure(
+                                        m_code.group(1), reason)
                                 break
                         if extract_failed:
                             break
 
                 if extract_failed:
-                    raise TransferError(f"PS5 unrar extraction failed: {failure_reason}")
+                    note = ""
+                    if ("password" in failure_reason.lower()
+                            and job.get("archive_password_guessed")):
+                        note = (" The password was guessed from the file name "
+                                f"(\"{job.get('archive_password')}\"); if this archive is "
+                                "not protected, clear the password and retry.")
+                    raise TransferError(f"PS5 unrar extraction failed: {failure_reason}{note}")
 
                 # Extraction finished! Check if staging directory still has unnormalized content
                 report("status", "Finalizing game files on PS5...")
@@ -2719,13 +2768,23 @@ def cleanup_orphan_download_caches(data_dir, jobs):
     root = os.path.join(str(data_dir), "downloads")
     if not os.path.isdir(root):
         return
+    if not jobs:
+        # An empty job list is ambiguous: it can mean "nothing queued" OR that state
+        # failed to load. Deleting every cache on that guess can destroy many GB of
+        # downloads, so refuse to sweep until there is at least one job to compare to.
+        return
     live = {}
+    referenced = set()
     for j in jobs or []:
         live[str(j.get("id"))] = j
+        if j.get("cache_dir"):
+            referenced.add(os.path.normcase(os.path.abspath(j["cache_dir"])))
     for entry in os.listdir(root):
         path = os.path.join(root, entry)
         if not os.path.isdir(path):
             continue
+        if os.path.normcase(os.path.abspath(path)) in referenced:
+            continue        # a job still points at this cache (restart rotates the id)
         job = live.get(entry)
         keep = bool(job) and (
             job.get("keep_local")
@@ -2780,6 +2839,10 @@ def _download_to_cache(source, cache_file, settings, token, stop_event, dl_state
                 with dl_state.cond:
                     dl_state.committed = 0
             if source.size is not None and existing >= source.size:
+                with dl_state.cond:
+                    dl_state.committed = existing
+                    dl_state.total = source.size
+                on_progress()
                 dl_state.finish()
                 return
             with dl_state.cond:
@@ -2847,12 +2910,31 @@ def _ps5_reachable(settings, timeout=5):
 
 
 def _disk_buffer_needs_full_download(job):
-    """Archives that get extracted, and multi-part sets, must land completely on disk
-    before anything can be sent: extraction and stitching both need the whole input."""
+    """True when nothing can be sent until the whole download has landed.
+
+    Only local staging genuinely needs that: unar runs on this PC and what gets
+    uploaded is the extracted payload. On-console extraction uploads the raw archive
+    to /data/unrar and only unpacks afterwards, so it can stream while downloading.
+    """
     if job.get("kind") == "multipart":
         return True
     extract_mode = str(job.get("extract_mode") or "none").lower()
     if not job.get("decompress") or extract_mode == "none":
+        return False
+    is_archive = bool(job.get("is_archive")
+                      or is_archive_candidate(job.get("name", ""))
+                      or is_archive_candidate(job.get("source", "")))
+    if not is_archive:
+        return False
+    return extract_mode != "ps5" or not find_unrar_ps5_payload()
+
+
+def _disk_buffer_uses_console_unrar(job):
+    """True when the upload leg should go through the /data/unrar + payload path."""
+    extract_mode = str(job.get("extract_mode") or "none").lower()
+    if not job.get("decompress") or extract_mode != "ps5":
+        return False
+    if not find_unrar_ps5_payload():
         return False
     return bool(job.get("is_archive")
                 or is_archive_candidate(job.get("name", ""))
@@ -2983,6 +3065,8 @@ def _disk_buffer_sequential(job, settings, token, report, save, cache_dir):
         name = valid_name(job["name"])
         cache_file = os.path.join(cache_dir, name)
         job["dl_total"] = source.size
+        job["dl_transferred"] = (os.path.getsize(cache_file)
+                                 if os.path.exists(cache_file) else 0)
         # Set the headline size immediately: until a progress event lands the monitor
         # would otherwise read "0 KB of Unknown size".
         if source.size:
@@ -3071,6 +3155,8 @@ def transfer_disk_buffer(job, settings, token, report, save):
                 f"{need/1e9:.1f} GB, {free/1e9:.1f} GB free in {cache_dir}.")
 
     job["dl_total"] = source.size
+    job["dl_transferred"] = (os.path.getsize(cache_file)
+                             if os.path.exists(cache_file) else 0)
     save()
 
     meter = Meter()
@@ -3096,11 +3182,23 @@ def transfer_disk_buffer(job, settings, token, report, save):
     try:
         # 1. Wait for the console, without holding the FTP lock.
         waited = 0.0
+        live = settings.get("_live_settings")
         while True:
             token.check()
             committed, total, done, error = dl_state.snapshot()
             if error is not None:
                 raise error
+            if live:
+                # Re-read the address every poll: the point of this mode is that the
+                # console can be set up after the download has already started.
+                try:
+                    current = live()
+                except Exception:
+                    current = None
+                if current:
+                    for key in ("host", "port", "username", "password", "folder"):
+                        if current.get(key) is not None:
+                            settings[key] = current[key]
             if _ps5_reachable(settings):
                 break
             pct = f"{committed * 100 // total}% downloaded" if total else f"{committed/1e9:.2f} GB downloaded"
@@ -3132,13 +3230,11 @@ def transfer_disk_buffer(job, settings, token, report, save):
                 token.check()
             acquired = True
         report("status", "PS5 online · starting upload")
-        ftp = connect_ftp(settings, token)
-        folder = valid_folder(job.get("folder") or settings["folder"])
-        # Create the destination path if needed, exactly like the other upload paths.
-        try:
-            ensure_folder(ftp, folder)
-        except ftplib.error_perm as e:
-            raise TransferError(f"PS5 folder {folder} is not writable or could not be created.") from e
+        if job.get("destination"):
+            job["destination"] = {k: settings[k] for k in
+                                  ("host", "port", "username") if k in settings}
+            job["destination"]["folder"] = job.get("folder") or settings.get("folder")
+            save()
 
         committed, total, done, error = dl_state.snapshot()
         if error is not None:
@@ -3155,6 +3251,24 @@ def transfer_disk_buffer(job, settings, token, report, save):
         )
         up_settings = {**settings, "_dl_state": dl_state}
         job["identity"] = None
+
+        if _disk_buffer_uses_console_unrar(job):
+            # The console unpacks it, so what travels is the raw archive. Hand the
+            # growing cache straight to that path: it uploads to /data/unrar and only
+            # triggers the payload once the upload has finished, which is exactly when
+            # the download has finished too. It emits its own "complete".
+            return transfer_ps5_remote_archive(job, up_settings, token, report, save,
+                                               source_override=tail_source,
+                                               size_override=source.size)
+
+        ftp = connect_ftp(settings, token)
+        folder = valid_folder(job.get("folder") or settings["folder"])
+        # Create the destination path if needed, exactly like the other upload paths.
+        try:
+            ensure_folder(ftp, folder)
+        except ftplib.error_perm as e:
+            raise TransferError(f"PS5 folder {folder} is not writable or could not be created.") from e
+
         expected = stream_file_to_ftp(ftp, tail_source, name, job, up_settings, token,
                                       report, save, meter=meter, hist=hist, started=started)
         job["transferred"] = expected
