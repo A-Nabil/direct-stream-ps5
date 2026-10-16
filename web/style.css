@@ -4354,3 +4354,8 @@ dialog#add-dialog {
 }
 
 
+
+.capture-live { margin-top: 10px; }
+.capture-live-img { display: block; width: 100%; max-width: 1100px; min-height: 120px; background: #111; border-radius: 8px; cursor: pointer; touch-action: manipulation; }
+.capture-live-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.capture-live-bar input { flex: 1 1 160px; min-width: 0; }

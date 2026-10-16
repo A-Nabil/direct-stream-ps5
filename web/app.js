@@ -2276,8 +2276,89 @@ const renderCaptureState = (title, body, showCancel, skipped, popups) => {
     </div>`;
 };
 
+// Live view: when the capture browser runs on a screenless server, show it here.
+const removeCaptureLive = () => { document.getElementById('capture-live')?.remove(); };
+
+const mountCaptureLive = () => {
+  removeCaptureLive();
+  const box = $('url-verification-status');
+  if (!box) return null;
+  const wrap = document.createElement('div');
+  wrap.id = 'capture-live';
+  wrap.className = 'capture-live';
+  wrap.innerHTML = `
+    <img class="capture-live-img" alt="Live browser view" draggable="false">
+    <div class="capture-live-bar">
+      <input type="text" class="capture-live-text" placeholder="Type here, then Send" autocomplete="off" autocapitalize="off">
+      <button type="button" data-live-send>Send</button>
+      <button type="button" data-live-key="Enter">Enter</button>
+      <button type="button" data-live-key="Backspace">⌫</button>
+      <button type="button" data-live-scroll="-400">▲</button>
+      <button type="button" data-live-scroll="400">▼</button>
+    </div>`;
+  box.insertAdjacentElement('afterend', wrap);
+  return wrap;
+};
+
+const sendCaptureInput = ev => {
+  if (!captureId) return;
+  api('browser_resolve', { action: 'input', id: captureId, event: ev }).catch(() => {});
+};
+
+const runCaptureLive = async () => {
+  const wrap = mountCaptureLive();
+  if (!wrap) return;
+  const img = wrap.querySelector('img');
+  const textIn = wrap.querySelector('.capture-live-text');
+  const point = e => {
+    const r = img.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (img.naturalWidth / r.width),
+             y: (e.clientY - r.top) * (img.naturalHeight / r.height) };
+  };
+  img.addEventListener('click', e => { sendCaptureInput({ type: 'click', ...point(e) }); });
+  img.addEventListener('wheel', e => {
+    e.preventDefault();
+    sendCaptureInput({ type: 'wheel', ...point(e), dy: e.deltaY });
+  }, { passive: false });
+  wrap.addEventListener('click', e => {
+    const k = e.target.closest('[data-live-key]');
+    if (k) { sendCaptureInput({ type: 'key', key: k.getAttribute('data-live-key') }); return; }
+    const sc = e.target.closest('[data-live-scroll]');
+    if (sc) {
+      const r = img.getBoundingClientRect();
+      sendCaptureInput({ type: 'wheel', x: img.naturalWidth / 2, y: img.naturalHeight / 2,
+                         dy: Number(sc.getAttribute('data-live-scroll')) });
+      return;
+    }
+    if (e.target.closest('[data-live-send]') && textIn.value) {
+      sendCaptureInput({ type: 'text', text: textIn.value });
+      textIn.value = '';
+    }
+  });
+  textIn.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (textIn.value) { sendCaptureInput({ type: 'text', text: textIn.value }); textIn.value = ''; }
+      sendCaptureInput({ type: 'key', key: 'Enter' });
+    }
+  });
+  let failures = 0;
+  while (!captureStop && captureId && document.body.contains(wrap)) {
+    try {
+      const f = await api('browser_resolve', { action: 'frame', id: captureId });
+      if (f.frame) img.src = 'data:image/jpeg;base64,' + f.frame;
+      failures = 0;
+    } catch (_) {
+      if (++failures > 20) break;
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  removeCaptureLive();
+};
+
 const cancelBrowserCapture = async () => {
   captureStop = true;
+  removeCaptureLive();
   if (!captureId) return;
   try { await api('browser_resolve', { action: 'cancel', id: captureId }); } catch (_) {}
   captureId = null;
@@ -2295,7 +2376,8 @@ const startBrowserCapture = async landingUrl => {
   }
   captureId = res.id;
   renderCaptureState('Waiting for the download link…',
-    'In the browser window: complete the check, then press Download. The link is captured automatically and the download is blocked.', true);
+    'In the browser view below (or the window on the host): complete the check, then press Download. The link is captured automatically and the download is blocked.', true);
+  runCaptureLive();
 
   while (!captureStop) {
     await new Promise(r => setTimeout(r, 1500));
@@ -2310,6 +2392,7 @@ const startBrowserCapture = async landingUrl => {
     }
     if (st.state === 'done' && st.url) {
       captureId = null;
+      removeCaptureLive();
       const box = $('source-urls');
       if (box) {
         const lines = box.value.split('\n').map(x => x.trim());
@@ -2330,6 +2413,7 @@ const startBrowserCapture = async landingUrl => {
     }
     if (st.state === 'error' || st.state === 'cancelled') {
       captureId = null;
+      removeCaptureLive();
       renderCaptureState(st.state === 'cancelled' ? 'Capture cancelled' : 'Capture failed',
         st.error || 'No download link was captured.', false, st.skipped, st.blocked_popups);
       return;

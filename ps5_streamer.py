@@ -1144,6 +1144,17 @@ class Manager:
             session = self.captures.get(sid)
         if not session:
             raise TransferError("That capture session is no longer active. Start it again.")
+        if action == "frame":
+            try:
+                return {"ok": True, "id": sid, **session.remote_frame(), **session.snapshot()}
+            except Exception as ex:
+                raise TransferError(f"Live view unavailable: {ex}")
+        if action == "input":
+            try:
+                session.remote_input(data.get("event") or {})
+            except Exception as ex:
+                raise TransferError(f"Input failed: {ex}")
+            return {"ok": True, "id": sid, **session.snapshot()}
         if action == "cancel":
             session.cancel()
         elif action != "status":
@@ -1838,9 +1849,10 @@ def main():
         return
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
-    server.token = secrets.token_urlsafe(32)
+    server.token = os.environ.get('DS5_TOKEN') or secrets.token_urlsafe(32)
     server.manager = Manager(directory)
     server.allowed_hosts = build_allowed_hosts(server.server_port)
+    server.allowed_hosts |= {f"{h}:{server.server_port}" for h in filter(None, os.environ.get('DS5_HOSTS','').split(','))}
     
     local_url = f"http://127.0.0.1:{server.server_port}/#session={server.token}"
     if args.host == "0.0.0.0":

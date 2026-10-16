@@ -402,6 +402,10 @@ class CaptureSession:
         self.skipped = []
         self.blocked_popups = []
         self._lock = threading.Lock()
+        self._rlock = threading.Lock()
+        self._rws = None
+        self.headless = False
+        self._xvfb = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -429,8 +433,32 @@ class CaptureSession:
             # straight at the URL can fire the download before we are listening.
             "about:blank",
         ]
+        # A server with no screen (e.g. a Raspberry Pi) runs the browser headless;
+        # the dashboard then shows it remotely through remote_frame()/remote_input().
+        self.headless = (os.environ.get("DS5_CAPTURE_HEADLESS") == "1"
+                         or (os.name != "nt" and sys.platform != "darwin"
+                             and not os.environ.get("DISPLAY")
+                             and not os.environ.get("WAYLAND_DISPLAY")))
+        xvfb_env = None
+        if self.headless:
+            # A normal (non-headless) Chromium on a private virtual screen when
+            # Xvfb exists: it is the same browser a person would use, just drawn
+            # off-screen. Plain headless mode is only the fallback.
+            xvfb_env = self._start_virtual_display()
+            if xvfb_env is None:
+                args[1:1] = ["--headless=new", "--disable-gpu", "--hide-scrollbars"]
+            else:
+                args[1:1] = ["--ozone-platform=x11"]
         try:
             kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if self.headless:
+                # Under a systemd user service the session bus and accessibility
+                # variables made Chromium stall on its first navigation, leaving
+                # a blank page. It needs neither.
+                env = dict(xvfb_env or os.environ)
+                env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+                env.pop("QT_ACCESSIBILITY", None)
+                kwargs["env"] = env
             if os.name == "nt":
                 # The dashboard frequently runs as a background/console-less
                 # process. On Windows a child inherits the parent's "show window"
@@ -480,6 +508,138 @@ class CaptureSession:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
 
+    def _start_virtual_display(self):
+        """Start a private Xvfb screen; return the environment to use, or None."""
+        exe = shutil.which("Xvfb")
+        if not exe:
+            return None
+        for n in range(90, 190):
+            if os.path.exists(f"/tmp/.X11-unix/X{n}") or os.path.exists(f"/tmp/.X{n}-lock"):
+                continue
+            try:
+                proc = subprocess.Popen(
+                    [exe, f":{n}", "-screen", "0", "1100x860x24", "-nolisten", "tcp"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                return None
+            for _ in range(40):
+                if os.path.exists(f"/tmp/.X11-unix/X{n}"):
+                    self._xvfb = proc
+                    env = dict(os.environ)
+                    env["DISPLAY"] = f":{n}"
+                    env.pop("WAYLAND_DISPLAY", None)
+                    return env
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            if proc.poll() is None:
+                return None  # started but never came up; don't burn through every display number
+        return None
+
+    def _plain_user_agent(self, port: int) -> str:
+        try:
+            ua = self._devtools(port, "/json/version").get("User-Agent", "")
+        except Exception:
+            return ""
+        return ua.replace("HeadlessChrome", "Chrome")
+
+    # -- remote view/control (for a browser nobody can see) ------------------
+
+    def _remote_ws(self):
+        """A dedicated DevTools socket to the capture tab, separate from the
+        listener sockets so replies never mix with download events."""
+        port = self.devtools_port
+        if not port:
+            raise RuntimeError("Browser not running.")
+        pages = [t for t in self._devtools(port, "/json/list") if t.get("type") == "page"]
+        target = next((t for t in pages if t.get("id") == self._main_tid), None) \
+            or (pages[0] if pages else None)
+        if not target:
+            raise RuntimeError("No browser tab open yet.")
+        # Do not poke the tab before it has left the blank start page: a
+        # screenshot during the first navigation left it stuck on a blank page.
+        if not self._navigated or (target.get("url") or "").startswith("about:blank"):
+            raise RuntimeError("The page is still starting.")
+        cur = getattr(self, "_rws", None)
+        if cur and cur[0] == target["id"]:
+            return cur[1]
+        if cur:
+            cur[1].close()
+        ws = WebSocket(target["webSocketDebuggerUrl"], timeout=5)
+        self._rws = (target["id"], ws)
+        self._rid = 100
+        return ws
+
+    def _remote_call(self, method: str, params=None, want_result: bool = False):
+        with self._rlock:
+            ws = self._remote_ws()
+            self._rid += 1
+            rid = self._rid
+            ws.send({"id": rid, "method": method, "params": params or {}})
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    msg = ws.recv()
+                except socket.timeout:
+                    continue
+                if msg and msg.get("id") == rid:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"].get("message", "DevTools error"))
+                    return msg.get("result", {})
+            raise TimeoutError("Browser did not answer.")
+
+    def remote_frame(self) -> dict:
+        """One JPEG of the capture tab, base64, with its viewport size."""
+        if self.state != "waiting":
+            raise RuntimeError("Capture is not active.")
+        res = self._remote_call("Page.captureScreenshot",
+                                {"format": "jpeg", "quality": 55})
+        return {"frame": res.get("data", ""), "width": 1100, "height": 860}
+
+    _SPECIAL_KEYS = {
+        "Enter": 13, "Backspace": 8, "Tab": 9, "Escape": 27, "Delete": 46,
+        "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40,
+        "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34,
+    }
+
+    def remote_input(self, ev: dict) -> None:
+        """Forward a click, scroll or keypress from the dashboard to the tab."""
+        if self.state != "waiting":
+            return
+        kind = str(ev.get("type") or "")
+
+        def num(name, lo=0, hi=5000):
+            return max(lo, min(hi, float(ev.get(name) or 0)))
+
+        if kind == "click":
+            x, y = num("x"), num("y")
+            base = {"x": x, "y": y, "button": "left", "clickCount": 1}
+            self._remote_call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+            self._remote_call("Input.dispatchMouseEvent", {**base, "type": "mousePressed"})
+            self._remote_call("Input.dispatchMouseEvent", {**base, "type": "mouseReleased"})
+        elif kind == "wheel":
+            self._remote_call("Input.dispatchMouseEvent", {
+                "type": "mouseWheel", "x": num("x"), "y": num("y"),
+                "deltaX": num("dx", -3000, 3000) if "dx" in ev else 0,
+                "deltaY": max(-3000, min(3000, float(ev.get("dy") or 0)))})
+        elif kind == "text":
+            text = str(ev.get("text") or "")[:200]
+            if text:
+                self._remote_call("Input.insertText", {"text": text})
+        elif kind == "key":
+            key = str(ev.get("key") or "")
+            code = self._SPECIAL_KEYS.get(key)
+            if code:
+                p = {"key": key, "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code}
+                if key == "Enter":
+                    p["text"] = "\r"
+                self._remote_call("Input.dispatchKeyEvent", {**p, "type": "keyDown"})
+                self._remote_call("Input.dispatchKeyEvent", {**p, "type": "keyUp"})
+
     def _run(self, port: int) -> None:
         try:
             self._wait_for_devtools(port)
@@ -523,6 +683,11 @@ class CaptureSession:
                      "params": {"behavior": "deny", "eventsEnabled": True}})
             ws.send({"id": 4, "method": "Page.setDownloadBehavior",
                      "params": {"behavior": "deny"}})
+            if self.headless and self._xvfb is None:
+                ua = self._plain_user_agent(port)
+                if ua:
+                    ws.send({"id": 7, "method": "Network.setUserAgentOverride",
+                             "params": {"userAgent": ua}})
             # Now that we are listening, drive the window to the landing page.
             if not self._navigated:
                 self._navigated = True
@@ -736,6 +901,12 @@ class CaptureSession:
 
     def _cleanup(self) -> None:
         self._stop.set()
+        if self._rws:
+            try:
+                self._rws[1].close()
+            except Exception:
+                pass
+            self._rws = None
         with self._lock:
             sockets = list(self._attached.values())
             self._attached.clear()
@@ -750,6 +921,13 @@ class CaptureSession:
                     self._proc.kill()
                 except Exception:
                     pass
+        if self._xvfb and self._xvfb.poll() is None:
+            try:
+                self._xvfb.terminate()
+                self._xvfb.wait(timeout=5)
+            except Exception:
+                pass
+        self._xvfb = None
         if self._profile:
             shutil.rmtree(self._profile, ignore_errors=True)
             self._profile = None
