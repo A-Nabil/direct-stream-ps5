@@ -123,6 +123,28 @@ def get_lan_ip():
         return "127.0.0.1"
 
 
+def repair_mojibake(text, limit=12):
+    """Undo UTF-8 text that was decoded as the platform codepage and saved again.
+
+    Before state.json was read as UTF-8, a "·" could come back as "Â·", be written
+    out, and be mangled again on the next start. The damage compounds: one job here
+    had grown a 43-character detail into 261 characters of noise. Each round trip is
+    exactly reversible, so re-apply it until the text stops changing.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    out = text
+    for _ in range(limit):
+        try:
+            nxt = out.encode("cp1252").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            break
+        if nxt == out:
+            break
+        out = nxt
+    return out
+
+
 def atomic_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(prefix=".ps5-", dir=str(path.parent))
@@ -319,6 +341,9 @@ class Manager:
             self.settings.pop("password", None)
             self.jobs = state.get("jobs", [])
             for job in self.jobs:
+                for field in ("detail", "name"):
+                    if job.get(field):
+                        job[field] = repair_mojibake(job[field])
                 if job.get("kind") == "url" and job.get("source"):
                     name = job.get("name", "")
                     if re.match(r'^[a-f0-9-]{16,}$', name, re.IGNORECASE) or "." not in name:
