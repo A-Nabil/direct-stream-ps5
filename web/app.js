@@ -1611,6 +1611,11 @@ const DEST_PRESETS = {
   '/mnt/usb0': 'USB drive (/mnt/usb0)',
 };
 
+function updateDestWarning() {
+  const warn = $('dest-usb-warning');
+  if (warn) warn.hidden = !($('modal-dest-folder')?.value.trim() || '').startsWith('/mnt/usb');
+}
+
 function setDestPreset(dest) {
   const input = $('modal-dest-folder');
   const hint = $('dest-hint');
@@ -1624,6 +1629,7 @@ function setDestPreset(dest) {
     if (hint) hint.textContent = 'Custom console directory';
     input?.focus();
   }
+  updateDestWarning();
 }
 
 document.querySelectorAll('.dest-preset-btn').forEach(btn => {
@@ -1640,6 +1646,7 @@ $('modal-dest-folder')?.addEventListener('input', e => {
   });
   const hint = $('dest-hint');
   if (hint) hint.textContent = DEST_PRESETS[val] || 'Custom console directory';
+  updateDestWarning();
 });
 
 function setArchiveExtractMode(mode) {

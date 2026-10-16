@@ -566,3 +566,8 @@ class UsbDestinationTests(unittest.TestCase):
     def test_destination_picker_offers_usb(self):
         html = (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text()
         self.assertIn('data-dest="/mnt/usb0"', html)
+
+    def test_usb_destination_shows_an_attach_warning(self):
+        root = Path(__file__).resolve().parents[1] / "web"
+        self.assertIn('id="dest-usb-warning"', (root / "index.html").read_text())
+        self.assertIn("updateDestWarning", (root / "app.js").read_text())

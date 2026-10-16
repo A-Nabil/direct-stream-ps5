@@ -4359,3 +4359,13 @@ dialog#add-dialog {
 .capture-live-img { display: block; width: 100%; max-width: 1100px; min-height: 120px; background: #111; border-radius: 8px; cursor: pointer; touch-action: manipulation; }
 .capture-live-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .capture-live-bar input { flex: 1 1 160px; min-width: 0; }
+
+.dest-usb-warning {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  color: #f5c06a;
+  background: rgba(245, 192, 106, 0.12);
+  border: 1px solid rgba(245, 192, 106, 0.35);
+}
