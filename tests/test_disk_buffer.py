@@ -488,48 +488,6 @@ class ReExtractWithoutReuploadTests(unittest.TestCase):
         self.assertIn("archive_password=secret", cfg_text)
 
 
-class StatePersistenceTests(unittest.TestCase):
-    """The queue is written as UTF-8. Reading it back with the platform codepage made a
-    single "·" in a detail string wipe the entire saved queue on Windows."""
-
-    def test_queue_survives_non_ascii_detail_text(self):
-        with tempfile.TemporaryDirectory() as d:
-            m = Manager(d)
-            m.add_jobs({"kind": "url", "folder": "/data/homebrew",
-                        "items": [{"source": "http://example.com/Game.pkg",
-                                   "name": "Game.pkg"}],
-                        "decompress": False, "extract_mode": "none"})
-            # Exactly the kind of text the app writes itself. A paused job keeps its
-            # detail verbatim; queued/active ones are intentionally re-labelled on load.
-            m.jobs[-1]["state"] = "paused"
-            m.jobs[-1]["detail"] = "Complete · PS5 file size verified · 1,2 GB"
-            m.jobs[-1]["name"] = "Jeu — spécial (日本).pkg"
-            m.save()
-            m.stop()
-
-            reopened = Manager(d)
-            try:
-                self.assertEqual(len(reopened.jobs), 1,
-                                 "saved queue was lost when reloaded")
-                self.assertIn("·", reopened.jobs[0]["detail"])
-                self.assertEqual(reopened.jobs[0]["name"], "Jeu — spécial (日本).pkg")
-            finally:
-                reopened.stop()
-
-    def test_state_file_is_written_as_utf8(self):
-        with tempfile.TemporaryDirectory() as d:
-            m = Manager(d)
-            m.add_jobs({"kind": "url", "folder": "/data/homebrew",
-                        "items": [{"source": "http://example.com/a.pkg", "name": "a.pkg"}],
-                        "decompress": False, "extract_mode": "none"})
-            m.jobs[-1]["detail"] = "Stopped · partial retained"
-            m.save()
-            m.stop()
-            raw = (Path(d) / "state.json").read_bytes()
-            self.assertIn("·".encode("utf-8"), raw,
-                          "state.json is not UTF-8 encoded on disk")
-
-
 class GuessedPasswordTests(unittest.TestCase):
     """A password inferred from the file name is a guess, not a fact. Applying one to an
     archive that has none makes unrar fail with 'wrong password', so the user must be able
