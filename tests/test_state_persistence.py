@@ -79,6 +79,41 @@ class StatePersistenceTests(unittest.TestCase):
             # And it must round-trip through an explicit UTF-8 read.
             json.loads((Path(d) / "state.json").read_text(encoding="utf-8"))
 
+    def test_existing_mojibake_is_repaired_on_load(self):
+        # Queues written by an older build already contain damage: a "·" that came
+        # back as "Â·" and was saved again. Each round trip compounded it, so the
+        # text must be unwound, not just prevented from getting worse.
+        from ps5_streamer import repair_mojibake
+        damaged = "Complete Ãƒâ€šÃ‚Â· Extracted on PS5 (0 GB Mac disk)"
+        self.assertEqual(repair_mojibake(damaged),
+                         "Complete · Extracted on PS5 (0 GB Mac disk)")
+
+    def test_repair_leaves_correct_text_alone(self):
+        from ps5_streamer import repair_mojibake
+        for good in ("Complete · PS5 file size verified",
+                     "Jeu — spécial.pkg", "日本.pkg", "done ✓",
+                     "Stopped. Resume when ready."):
+            self.assertEqual(repair_mojibake(good), good,
+                             "repair damaged already-correct text: %r" % good)
+            # And applying it twice must not drift.
+            self.assertEqual(repair_mojibake(repair_mojibake(good)), good)
+
+    def test_damaged_queue_is_healed_when_reopened(self):
+        with tempfile.TemporaryDirectory() as d:
+            manager = Manager(d)
+            job = self._queue_one(manager)
+            job["state"] = "paused"
+            job["detail"] = "Stopped Ãƒâ€šÃ‚Â· partial retained on PS5"
+            manager.save()
+            manager.stop()
+
+            reopened = Manager(d)
+            try:
+                self.assertEqual(reopened.jobs[0]["detail"],
+                                 "Stopped · partial retained on PS5")
+            finally:
+                reopened.stop()
+
     def test_sources_never_read_saved_json_without_an_encoding(self):
         # The write side already pins UTF-8; the read side must not rely on the
         # platform default, which differs between Windows and everything else.
