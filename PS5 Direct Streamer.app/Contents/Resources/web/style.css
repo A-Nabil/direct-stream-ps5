@@ -2348,6 +2348,190 @@ a { color: inherit; text-decoration: none; }
   background: #e0f2fe;
 }
 
+/* ── Transfer phases ───────────────────────────────────────────────────────
+   Each leg of the journey states its own case: where it runs, what it is doing
+   right now, how far along it is. Two bare tracks were ambiguous; a track that
+   names itself is not. */
+.phase-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.phase-row {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.phase-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.phase-step {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  transition: color .25s ease, background .25s ease, border-color .25s ease;
+}
+
+.phase-route {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.62);
+  white-space: nowrap;
+}
+
+.phase-route b {
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.34);
+  padding: 0 2px;
+}
+
+/* The live word for this leg, pushed hard right next to its own percentage. */
+.phase-state {
+  margin-left: auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.phase-pct {
+  flex: none;
+  margin-left: 12px;
+  min-width: 46px;
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 12.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.42);
+  transition: color .25s ease;
+}
+
+.phase-track {
+  position: relative;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+.phase-fill {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.22);
+  transition: width .45s cubic-bezier(.22, .61, .36, 1), background .3s ease;
+}
+
+.phase-meta {
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.42);
+  font-variant-numeric: tabular-nums;
+  min-height: 15px;
+}
+
+/* ── Per-leg state ─────────────────────────────────────────────────────── */
+.phase-row.is-active .phase-step {
+  color: #0b1220;
+  background: currentColor;
+  border-color: transparent;
+}
+
+.phase-row.is-active .phase-route,
+.phase-row.is-active .phase-state { color: rgba(255, 255, 255, 0.88); }
+.phase-row.is-active .phase-pct   { color: #ffffff; }
+.phase-row.is-active .phase-meta  { color: rgba(255, 255, 255, 0.66); }
+
+/* Download leg runs amber, console leg runs blue: colour alone tells them apart
+   even before the labels are read. */
+.phase-fill.dl { background: linear-gradient(90deg, #d97706, #fbbf24); }
+.phase-fill.up { background: linear-gradient(90deg, #2563eb, #60a5fa); }
+
+.phase-row.is-active.phase-dl .phase-step { color: #f59e0b; }
+.phase-row.is-active.phase-up .phase-step { color: #60a5fa; }
+
+/* A moving sheen marks the leg that is actually transferring right now. */
+.phase-row.is-active .phase-fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.34) 50%,
+    transparent 100%);
+  animation: phase-sheen 1.9s linear infinite;
+}
+
+@keyframes phase-sheen {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+
+/* Waiting: nothing is moving, so the bar must not pretend otherwise. */
+.phase-row.is-waiting .phase-state {
+  color: #fbbf24;
+  animation: phase-breathe 2.2s ease-in-out infinite;
+}
+
+.phase-row.is-waiting .phase-track {
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.07) 0 6px,
+    rgba(255, 255, 255, 0.03) 6px 12px);
+}
+
+@keyframes phase-breathe {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+.phase-row.is-done .phase-step {
+  color: #0b1220;
+  background: #10b981;
+  border-color: transparent;
+}
+
+.phase-row.is-done .phase-state { color: #34d399; }
+.phase-row.is-done .phase-pct   { color: rgba(255, 255, 255, 0.72); }
+.phase-row.is-done .phase-fill  { background: #10b981; }
+.phase-row.is-done .phase-fill::after { animation: none; }
+
+.phase-row.is-idle { opacity: 0.55; }
+
+@media (prefers-reduced-motion: reduce) {
+  .phase-fill { transition: none; }
+  .phase-row.is-active .phase-fill::after,
+  .phase-row.is-waiting .phase-state { animation: none; }
+}
+
+@media (max-width: 600px) {
+  .phase-route b { display: none; }
+  .phase-route { letter-spacing: 0.04em; }
+}
+
 .verify-capture-btn {
   margin-top: 10px;
   display: inline-flex;

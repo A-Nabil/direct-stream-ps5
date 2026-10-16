@@ -15,6 +15,7 @@ import re
 import secrets
 import signal
 import subprocess
+import contextlib
 import shutil
 import sys
 import tempfile
@@ -30,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from transfer_core import (Cancelled, Meter, StopToken, TransferError, close_ftp,
     connect_ftp, make_reader, probe_source, safe_text, transfer, valid_folder,
+    cleanup_orphan_download_caches,
     valid_name, valid_url, check_ftp_storage, validate_source_url, validate_multipart_source,
     find_unar_tool, cleanup_stale_staging_directories, MIB, HEADERS,
     find_unrar_ps5_payload, send_ps5_payload, generate_unrar_config, fetch_ps5_unrar_log,
@@ -303,6 +305,10 @@ class Manager:
         self.history = []
         cleanup_stale_staging_directories()
         self._load()
+        try:
+            cleanup_orphan_download_caches(self.directory, self.jobs)
+        except Exception:
+            pass
         self.thread = threading.Thread(target=self._loop, daemon=True, name="transfer-queue")
         self.thread.start()
 
@@ -476,6 +482,11 @@ class Manager:
                 "total": None,
                 "transferred": 0,
                 "overwrite": bool(data.get("overwrite", False)),
+                "disk_buffer": bool(data.get("disk_buffer")),
+                "keep_local": bool(data.get("keep_local")),
+                "dl_transferred": 0,
+                "dl_total": None,
+                "cache_dir": "",
                 "decompress": is_decomp,
                 "extract_mode": job_extract_mode,
                 "archive_password": multi_pwd,
@@ -611,6 +622,11 @@ class Manager:
                         "total": item_total,
                         "transferred": 0,
                         "overwrite": bool(data.get("overwrite", False)),
+                        "disk_buffer": bool(data.get("disk_buffer")) and item_kind == "url",
+                        "keep_local": bool(data.get("keep_local")),
+                        "dl_transferred": 0,
+                        "dl_total": None,
+                        "cache_dir": "",
                         "decompress": is_decomp,
                         "extract_mode": job_extract_mode,
                         "archive_encrypted": is_enc,
@@ -807,6 +823,10 @@ class Manager:
                     )
                     if action == "restart" or (action == "resume" and is_unowned_error):
                         # New partial path; never delete a potentially valuable old partial silently.
+                        if job.get("cache_dir"):
+                            shutil.rmtree(job["cache_dir"], ignore_errors=True)
+                            job["cache_dir"] = ""
+                            job["dl_transferred"] = 0
                         job["id"] = secrets.token_hex(6)
                         job["identity"] = None
                         job["stage_owned"] = False
@@ -814,9 +834,29 @@ class Manager:
                         job["destination"] = None
                     job["state"] = "queued"
                     job["detail"] = "Queued to resume" if action == "resume" and not is_unowned_error else "Queued to restart from zero; old partial retained"
+                elif action == "toggle_disk_buffer":
+                    if job["id"] == self.current:
+                        raise TransferError("Pause the transfer before changing download mode.")
+                    if job["state"] == "completed":
+                        raise TransferError("This transfer is already complete.")
+                    if job.get("kind") not in ("url", "multipart"):
+                        raise TransferError("Local sources are already on this PC.")
+                    job["disk_buffer"] = not job.get("disk_buffer")
+                    if not job["disk_buffer"] and job.get("cache_dir"):
+                        shutil.rmtree(job["cache_dir"], ignore_errors=True)
+                        job["cache_dir"] = ""
+                        job["dl_transferred"] = 0
+                    job["detail"] = ("Queued · downloads to this PC first"
+                                     if job["disk_buffer"] else "Queued")
+                elif action == "toggle_keep_local":
+                    if job["state"] == "completed":
+                        raise TransferError("This transfer is already complete.")
+                    job["keep_local"] = not job.get("keep_local")
                 elif action == "remove":
                     if job["id"] == self.current:
                         raise TransferError("Pause the job before removing it.")
+                    if job.get("cache_dir"):
+                        shutil.rmtree(job["cache_dir"], ignore_errors=True)
                     self.jobs.remove(job)
                 elif action in ("up", "down"):
                     i = self.jobs.index(job)
@@ -1163,9 +1203,16 @@ class Manager:
                     job["total"] = value["total"]
                 self.history.append({"up": value["upload_bps"], "down": value["download_bps"]})
                 self.history = self.history[-120:]
+            elif event == "dl_progress":
+                job["dl_transferred"] = value["transferred"]
+                if value.get("total"):
+                    job["dl_total"] = value["total"]
             elif event == "complete":
                 job["state"] = "completed"
                 job.pop("error_info", None)
+                if job.get("cache_dir") and not job.get("keep_local"):
+                    shutil.rmtree(job["cache_dir"], ignore_errors=True)
+                    job["cache_dir"] = ""
                 if job.get("total"):
                     job["transferred"] = job["total"]
                 elif value.get("size"):
@@ -1193,7 +1240,8 @@ class Manager:
                 if not job:
                     self.running = False
                     continue
-                cfg = {**self.settings, "password": self.password}
+                cfg = {**self.settings, "password": self.password,
+                       "_ftp_lock": self.ftp_lock, "_data_dir": str(self.directory)}
                 destination = {k: cfg[k] for k in ("host", "port", "folder", "username")}
                 if job.get("destination") and job["destination"] != destination:
                     job["state"] = "failed"
@@ -1212,7 +1260,10 @@ class Manager:
             try:
                 if sys.platform == "darwin":
                     caffeinate = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
-                with self.ftp_lock:
+                # Disk-buffer jobs download and wait for the console without any FTP
+                # work; holding the lock there would block browsing/diagnostics.
+                lock_ctx = contextlib.nullcontext() if job.get("disk_buffer") else self.ftp_lock
+                with lock_ctx:
                     for attempt in range(cfg["retries"] + 1):
                         token.check()
                         with self.lock:

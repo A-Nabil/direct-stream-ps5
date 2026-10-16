@@ -396,6 +396,7 @@ function row(job, index) {
   const isArchive = ['zip', 'zip64', 'rar', '7z', 'tar', 'gz'].includes(v.tag.toLowerCase()) || job.is_zip || job.is_archive || !!job.archive_info;
 
   const pct = job.state === 'completed' ? 100 : (job.total ? Math.min(100, (job.transferred || 0) / job.total * 100) : 0);
+  const dlPct = job.dl_total ? Math.min(100, (job.dl_transferred || 0) / job.dl_total * 100) : (job.state === 'completed' ? 100 : 0);
   const isActive = activeStates.includes(job.state);
   let primary = '';
   if (isActive) {
@@ -511,8 +512,13 @@ function row(job, index) {
     <td>${job.total ? bytes(job.total) : '—'}</td>
     <td>
       <div class="row-progress">
+        ${job.disk_buffer ? `
+          <div class="row-track row-track-download" title="Downloading to this PC"><div data-width="${dlPct}"></div></div>
+        ` : ''}
         <div class="row-track ${job.state === 'completed' ? 'completed' : ''}"><div data-width="${displayPct}"></div></div>
-        <span class="${job.state === 'completed' ? 'green-percent' : ''}">${isExtracting ? (extractPct !== null ? `${extractPct}% (PS5)` : 'Extracting') : pct.toFixed(0) + '%'}</span>
+        <span class="${job.state === 'completed' ? 'green-percent' : ''}">${job.disk_buffer
+          ? `DL ${dlPct.toFixed(0)}% · PS5 ${pct.toFixed(0)}%`
+          : (isExtracting ? (extractPct !== null ? `${extractPct}% (PS5)` : 'Extracting') : pct.toFixed(0) + '%')}</span>
       </div>
     </td>
     <td>
@@ -956,6 +962,76 @@ function render(s) {
 
     if ($('progress-fill')) $('progress-fill').style.width = displayHeroPct + '%';
     if ($('main-progress')) $('main-progress').setAttribute('aria-valuenow', displayHeroPct.toFixed(1));
+
+    // Each leg reports itself: where it runs, what it is doing, how far along.
+    const setPhase = (row, { pct, state, meta, cls, track, fill, pctEl, metaEl, stateEl }) => {
+      const el = $(row);
+      if (!el) return;
+      el.className = 'phase-row ' + (row === 'phase-download' ? 'phase-dl ' : 'phase-up ') + cls;
+      if ($(fill)) $(fill).style.width = Math.max(0, Math.min(100, pct)) + '%';
+      if ($(track)) $(track).setAttribute('aria-valuenow', pct.toFixed(0));
+      if ($(pctEl)) $(pctEl).textContent = pct.toFixed(0) + '%';
+      if ($(stateEl)) $(stateEl).textContent = state;
+      if ($(metaEl)) $(metaEl).textContent = meta;
+    };
+
+    const m = state.metrics || {};
+    const rate = v => (v > 0 ? ` · ${(v / 1e6).toFixed(1)} MB/s` : '');
+    const isDisk = !!active.disk_buffer;
+    const dlTotal = active.dl_total || 0;
+    const dlDone = dlTotal > 0 && (active.dl_transferred || 0) >= dlTotal;
+    const dlPct = dlTotal ? Math.min(100, (active.dl_transferred || 0) / dlTotal * 100) : 0;
+    const upStarted = (active.transferred || 0) > 0;
+    const finished = active.state === 'completed';
+
+    const dlRow = $('phase-download');
+    if (dlRow) dlRow.hidden = !isDisk;
+
+    if (isDisk) {
+      setPhase('phase-download', {
+        pct: finished ? 100 : dlPct,
+        state: (finished || dlDone) ? 'Complete' : 'Downloading',
+        meta: dlTotal
+          ? `${bytes(active.dl_transferred || 0)} of ${bytes(dlTotal)}${(finished || dlDone) ? '' : rate(m.download_bps)}`
+          : 'Contacting source',
+        cls: (finished || dlDone) ? 'is-done' : 'is-active',
+        track: 'download-progress', fill: 'download-fill',
+        pctEl: 'phase-dl-pct', metaEl: 'download-bytes', stateEl: 'phase-dl-state',
+      });
+    }
+
+    // The console leg: idle, blocked on the download, blocked on the PS5, or running.
+    let upState, upCls, upMeta;
+    if (finished) {
+      upState = 'Complete'; upCls = 'is-done';
+      upMeta = `${bytes(active.total || 0)} verified on PS5`;
+    } else if (isExtracting) {
+      upState = 'Extracting'; upCls = 'is-active';
+      upMeta = cleanDet || 'Unpacking on the console';
+    } else if (upStarted) {
+      upState = 'Sending'; upCls = 'is-active';
+      upMeta = `${bytes(active.transferred || 0)} of ${bytes(active.total || 0)}${rate(m.upload_bps)}`;
+    } else if (isDisk && !dlDone) {
+      upState = 'Queued'; upCls = 'is-idle';
+      upMeta = 'Starts once enough of the download has arrived';
+    } else if (isDisk) {
+      upState = 'Waiting for PS5'; upCls = 'is-waiting';
+      upMeta = 'Download finished · the console is not reachable yet';
+    } else {
+      upState = 'Starting'; upCls = 'is-active';
+      upMeta = 'Opening the connection to your console';
+    }
+
+    setPhase('phase-upload', {
+      pct: displayHeroPct, state: upState, meta: upMeta, cls: upCls,
+      track: 'main-progress', fill: 'progress-fill',
+      pctEl: 'phase-up-pct', metaEl: 'phase-up-meta', stateEl: 'phase-up-state',
+    });
+    if ($('phase-up-step')) $('phase-up-step').textContent = isDisk ? '2' : '1';
+    // With per-leg figures on show, the headline bytes/percent only repeat one leg
+    // and contradict the other. Let the phases own the numbers.
+    const metaLeft = document.querySelector('.transfer-progress-meta .meta-left');
+    if (metaLeft) metaLeft.style.display = isDisk ? 'none' : '';
     if ($('progress-percent')) {
       if (isExtracting && extractPct !== null) {
         $('progress-percent').textContent = `${extractPct}% (PS5)`;
@@ -999,6 +1075,11 @@ function render(s) {
         stateBadge.textContent = 'Queued';
         stateBadge.className = 'status-badge queued';
       }
+      if ($('phase-download')) $('phase-download').hidden = true;
+      if ($('phase-upload')) $('phase-upload').className = 'phase-row phase-up is-idle';
+      if ($('phase-up-state')) $('phase-up-state').textContent = 'Idle';
+      if ($('phase-up-pct')) $('phase-up-pct').textContent = '0%';
+      if ($('phase-up-meta')) $('phase-up-meta').textContent = 'No transfer running';
       if ($('progress-fill')) {
         $('progress-fill').style.width = '0%';
         $('progress-fill').style.background = '';
@@ -1164,7 +1245,9 @@ function render(s) {
       : 'Add files now. Send them in order.';
   }
 
-  const signature = JSON.stringify(jobs.map(j => [j.id, j.state, j.name, j.detail, j.total, Math.floor(j.transferred / 1e6)]));
+  const signature = JSON.stringify(jobs.map(j => [j.id, j.state, j.name, j.detail, j.total,
+    Math.floor(j.transferred / 1e6),
+    j.disk_buffer ? Math.floor((j.dl_transferred || 0) / 1e6) : 0, j.dl_total || 0, !!j.keep_local]));
   if (signature !== queueSignature && !document.querySelector('#queue-action-menu:not([hidden])') && !$('queue-body').contains(document.activeElement)) {
     queueSignature = signature;
     $('queue-body').innerHTML = jobs.map(row).join('');
@@ -2133,6 +2216,19 @@ $('source-urls')?.addEventListener('input', () => {
   refreshVerifyButtonLabel();
 });
 $('local-path')?.addEventListener('input', updateAddPreview);
+const syncDiskBufferOptions = () => {
+  const on = !!$('disk-buffer')?.checked;
+  const keep = $('keep-local');
+  if (keep) {
+    keep.disabled = !on;
+    if (!on) keep.checked = false;
+  }
+  const row = $('keep-local-option');
+  if (row) row.style.opacity = on ? '1' : '0.55';
+};
+$('disk-buffer')?.addEventListener('change', syncDiskBufferOptions);
+syncDiskBufferOptions();
+
 $('btn-verify-links')?.addEventListener('click', runVerifyLinks);
 // --- Browser-assisted capture: the user clears the CAPTCHA, we catch the URL ---
 let captureId = null;
@@ -2323,6 +2419,8 @@ $('add-form').addEventListener('submit', async e => {
       decompress: (sourceKind === 'folder' ? false : (modalExtractMode !== 'none')),
       extract_mode: (sourceKind === 'folder' ? 'none' : modalExtractMode),
       staged_extraction: (modalExtractMode === 'mac'),
+      disk_buffer: $('disk-buffer')?.checked || false,
+      keep_local: $('keep-local')?.checked || false,
       archive_password: $('archive-password')?.value?.trim() || '',
       overwrite: $('overwrite').checked
     });
@@ -2331,6 +2429,9 @@ $('add-form').addEventListener('submit', async e => {
     $('local-path').value = '';
     $('file-name').value = '';
     if ($('archive-password')) $('archive-password').value = '';
+    if ($('disk-buffer')) $('disk-buffer').checked = false;
+    if ($('keep-local')) $('keep-local').checked = false;
+    syncDiskBufferOptions();
     if ($('archive-password-row')) $('archive-password-row').hidden = true;
     $('overwrite').checked = false;
     resetVerifyStatus(true);

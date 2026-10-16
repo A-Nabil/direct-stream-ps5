@@ -4,6 +4,7 @@ import ftplib
 import hashlib
 import http.client
 import io
+import json
 import math
 import os
 import posixpath
@@ -245,7 +246,7 @@ class SourceInfo:
             return False
         if self.kind == "multipart":
             return bool(self.parts) and all(p.resumable() and p.size is not None for p in self.parts)
-        return self.kind == "local" or (self.ranges and bool(self.etag or self.modified))
+        return self.kind in ("local", "tail_local") or (self.ranges and bool(self.etag or self.modified))
 
 
 def probe_source(kind, location, token, resolve_depth=0, decompress=True, origin=None):
@@ -997,6 +998,85 @@ class MultiPartReader:
             self.prewarm_thread.join(timeout=2)
 
 
+class DownloadState:
+    """Shared hand-off between the cache downloader and the tail reader.
+
+    `committed` is only ever advanced AFTER the bytes have been flushed to disk, so a
+    reader that trusts `committed` can never read past durable data. File size is
+    deliberately not used as the signal: it advances before flush.
+    """
+
+    def __init__(self, total=None, committed=0):
+        self.cond = threading.Condition()
+        self.committed = committed
+        self.total = total
+        self.done = False
+        self.error = None
+
+    def publish(self, written):
+        with self.cond:
+            self.committed += written
+            self.cond.notify_all()
+
+    def finish(self, error=None):
+        with self.cond:
+            if error is not None:
+                self.error = error
+            self.done = True
+            self.cond.notify_all()
+
+    def snapshot(self):
+        with self.cond:
+            return self.committed, self.total, self.done, self.error
+
+
+class TailLocalReader:
+    """Reads a cache file that is still being written by the downloader thread.
+
+    Blocks (token-aware) while the uploader has caught up with the download, and only
+    reports EOF once the downloader is finished and every committed byte is drained.
+    Starting offsets beyond the current download position are allowed: the reader simply
+    waits for the download to reach them, which is what makes FTP REST resume work.
+    """
+
+    def __init__(self, path, offset, dl_state, token):
+        self.token = token
+        self.dl_state = dl_state
+        self.pos = offset
+        self.closed = threading.Event()
+        self.handle = open(path, "rb")
+        self.handle.seek(offset)
+
+    def read(self, size=BLOCK):
+        while not self.closed.is_set():
+            self.token.check()
+            with self.dl_state.cond:
+                available = self.dl_state.committed - self.pos
+                if available <= 0:
+                    if self.dl_state.error is not None:
+                        raise self.dl_state.error
+                    if self.dl_state.done:
+                        return b""
+                    self.dl_state.cond.wait(0.25)
+                    continue
+            block = self.handle.read(min(size, available))
+            if not block:
+                # Should not happen: committed never exceeds flushed bytes.
+                continue
+            self.pos += len(block)
+            # Deliberately NOT metered as downloaded: the cache downloader already
+            # counted these bytes, and double counting corrupts the reported rates.
+            return block
+        raise Cancelled()
+
+    def close(self):
+        self.closed.set()
+        try:
+            self.handle.close()
+        except Exception:
+            pass
+
+
 def make_reader(source, offset, settings, token, meter, on_part_change=None):
     loc = source.location if hasattr(source, "location") and isinstance(source.location, str) else ""
     orig = getattr(source, "original_url", "") or ""
@@ -1005,6 +1085,8 @@ def make_reader(source, offset, settings, token, meter, on_part_change=None):
         return ZipStreamingReader(source, settings["buffer_mb"], token, meter, headers)
     if source.kind.startswith("archive_"):
         return ArchiveStreamingReader(source, offset, settings["buffer_mb"], token, meter, headers)
+    if source.kind == "tail_local":
+        return TailLocalReader(source.location, offset, settings["_dl_state"], token)
     if source.kind == "multipart":
         return MultiPartReader(source, offset, settings, token, meter, on_part_change=on_part_change)
     if source.kind == "url" and source.ranges and source.size is not None and settings["streams"] > 1:
@@ -2373,6 +2455,7 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
                 stage_dir = f"{extract_loc}/.unrar-staging"
                 extract_done = False
                 extract_failed = False
+                done_by_hint = False
                 failure_reason = ""
                 extracted_title_id = ""
                 extracted_final_path = ""
@@ -2445,12 +2528,15 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
                     if extract_done:
                         break
 
-                    # 3. Check if archive was deleted on PS5 (unrar-ps5 delete_after=1 deletes it upon success)
+                    # 3. Check if archive was deleted on PS5 (unrar-ps5 delete_after=1 deletes it upon success).
+                    #    This is only a HINT: the archive is removed before later stages can
+                    #    still fail, so the log is drained again below before declaring success.
                     if poll_count % 3 == 0:
                         try:
                             unrar_files = ftp.nlst(unrar_base)
                             if primary_archive_name not in unrar_files:
                                 extract_done = True
+                                done_by_hint = True
                                 break
                         except Exception:
                             pass
@@ -2501,6 +2587,43 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
                         "bottleneck": "PS5 SSD Unpack"
                     })
                     save()
+
+                if done_by_hint and not extract_failed:
+                    # The archive disappearing only means unpacking got far enough to
+                    # delete it. Give the payload a moment and read the tail of the log so
+                    # a late failure is not reported to the user as a success.
+                    for _ in range(3):
+                        token.check()
+                        time.sleep(2.0)
+                        try:
+                            buf = io.BytesIO()
+                            ftp.retrbinary(f"RETR {log_path}", buf.write, rest=log_offset)
+                            appended = buf.getvalue()
+                        except Exception:
+                            break
+                        if not appended:
+                            continue
+                        log_offset += len(appended)
+                        for line in [ln.strip() for ln in
+                                     appended.decode("utf-8", errors="replace").splitlines()
+                                     if ln.strip()]:
+                            if line.startswith(("archive_error", "extract_error",
+                                                "sidecar_config_error", "config_error",
+                                                "UnRAR error:")):
+                                extract_failed = True
+                                failure_reason = line
+                                break
+                            m_code = re.search(r"code=(-?\d+)", line)
+                            if line.startswith("result ") and m_code:
+                                m_reason = re.search(r"reason=([^\s]+)", line)
+                                reason = m_reason.group(1) if m_reason else "unknown"
+                                if int(m_code.group(1)) != 0 and reason != "success":
+                                    extract_failed = True
+                                    failure_reason = (f"Extraction failed "
+                                                      f"(code={m_code.group(1)}, reason={reason})")
+                                break
+                        if extract_failed:
+                            break
 
                 if extract_failed:
                     raise TransferError(f"PS5 unrar extraction failed: {failure_reason}")
@@ -2575,10 +2698,499 @@ def transfer_ps5_remote_archive(job, settings, token, report, save):
         close_ftp(ftp, token, clean)
 
 
+def download_cache_root(settings):
+    """Root directory for persistent per-job download caches.
+
+    Deliberately NOT the system temp dir: cleanup_stale_staging_directories() deletes
+    ps5_staged_* there after an hour, which would destroy a cache waiting for the console.
+    """
+    base = settings.get("download_dir") or settings.get("_data_dir") or ""
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".ps5-transfer")
+    return os.path.join(base, "downloads")
+
+
+def job_cache_dir(job, settings):
+    return os.path.join(download_cache_root(settings), str(job.get("id") or "unknown"))
+
+
+def cleanup_orphan_download_caches(data_dir, jobs):
+    """Delete cache directories whose job no longer wants them."""
+    root = os.path.join(str(data_dir), "downloads")
+    if not os.path.isdir(root):
+        return
+    live = {}
+    for j in jobs or []:
+        live[str(j.get("id"))] = j
+    for entry in os.listdir(root):
+        path = os.path.join(root, entry)
+        if not os.path.isdir(path):
+            continue
+        job = live.get(entry)
+        keep = bool(job) and (
+            job.get("keep_local")
+            or job.get("state") not in ("completed", "cancelled")
+        )
+        if not keep:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _cache_meta_path(cache_dir):
+    return os.path.join(cache_dir, "meta.json")
+
+
+def _read_cache_meta(cache_dir):
+    try:
+        with open(_cache_meta_path(cache_dir), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_cache_meta(cache_dir, meta):
+    try:
+        with open(_cache_meta_path(cache_dir), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+
+def _source_meta(source):
+    return {
+        "size": source.size,
+        "etag": source.etag,
+        "modified": source.modified,
+        "filename": source.filename,
+    }
+
+
+def _download_to_cache(source, cache_file, settings, token, stop_event, dl_state,
+                       meter, on_progress):
+    """Fetch `source` into `cache_file`, appending and publishing flushed byte counts."""
+    attempt = 0
+    while not stop_event.is_set():
+        reader = None
+        try:
+            existing = os.path.getsize(cache_file) if os.path.exists(cache_file) else 0
+            if existing and not source.resumable():
+                # Cannot resume this source; start the cache over.
+                with open(cache_file, "wb"):
+                    pass
+                existing = 0
+                with dl_state.cond:
+                    dl_state.committed = 0
+            if source.size is not None and existing >= source.size:
+                dl_state.finish()
+                return
+            with dl_state.cond:
+                dl_state.committed = existing
+                dl_state.total = source.size
+            reader = make_reader(source, existing, settings, token, meter)
+            last_report = 0.0
+            with open(cache_file, "ab") as handle:
+                while not stop_event.is_set():
+                    token.check()
+                    block = reader.read(BLOCK)
+                    if not block:
+                        break
+                    handle.write(block)
+                    handle.flush()
+                    dl_state.publish(len(block))
+                    now = time.monotonic()
+                    if now - last_report >= 0.4:
+                        last_report = now
+                        on_progress()
+            on_progress()
+            dl_state.finish()
+            return
+        except Cancelled:
+            dl_state.finish()
+            return
+        except TransferError as e:
+            dl_state.finish(e)
+            return
+        except Exception as e:
+            if stop_event.is_set():
+                dl_state.finish()
+                return
+            if attempt >= int(settings.get("retries", 3)):
+                dl_state.finish(e)
+                return
+            delay = min(30, 5 * 2 ** attempt)
+            attempt += 1
+            try:
+                token.wait(delay)
+            except Cancelled:
+                dl_state.finish()
+                return
+        finally:
+            if reader:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+
+
+def _ps5_reachable(settings, timeout=5):
+    host = settings.get("host") or ""
+    if not host:
+        return False
+    try:
+        port = int(settings.get("port") or 1337)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _disk_buffer_needs_full_download(job):
+    """Archives that get extracted, and multi-part sets, must land completely on disk
+    before anything can be sent: extraction and stitching both need the whole input."""
+    if job.get("kind") == "multipart":
+        return True
+    extract_mode = str(job.get("extract_mode") or "none").lower()
+    if not job.get("decompress") or extract_mode == "none":
+        return False
+    return bool(job.get("is_archive")
+                or is_archive_candidate(job.get("name", ""))
+                or is_archive_candidate(job.get("source", "")))
+
+
+def _await_download(dl_state, token, report, label, emit_dl, meter=None, hist=None,
+                    started=None, settings=None, total_hint=None, after=""):
+    """Block until the cache download finishes, surfacing progress while we wait.
+
+    Also emits ordinary "progress" events. The monitor's headline size and speeds come
+    from those; without them it shows "0 KB of Unknown size" and "—" for the whole
+    download phase, because nothing else writes job["total"] or Manager.metrics.
+    """
+    settings = settings or {}
+    if started is None:
+        started = time.monotonic()
+    if hist is None:
+        hist = [(started, 0, 0)]
+    while True:
+        token.check()
+        committed, total, done, error = dl_state.snapshot()
+        if error is not None:
+            raise error
+        if done:
+            emit_dl()
+            return committed
+        pct = f"{committed * 100 // total}%" if total else f"{committed/1e9:.2f} GB"
+        suffix = f" · {after}" if after else ""
+        report("status", f"Downloading {label} to this PC · {pct}{suffix}")
+        emit_dl()
+        if meter is not None:
+            now = time.monotonic()
+            snap = meter.snapshot()
+            _up, down = windowed_rates(hist, now, snap)
+            report("progress", {
+                "transferred": 0,
+                "total": total_hint or total or committed or 1,
+                "upload_bps": 0,
+                "download_bps": down,
+                "buffered": snap["buffered"],
+                "buffer_capacity": settings.get("buffer_mb", 16) * MIB,
+                "elapsed": now - started,
+                "eta": ((total - committed) / down) if (total and down) else None,
+                "bottleneck": "Downloading to this PC",
+                "offset": 0,
+                "current_file": label,
+            })
+        token.wait(0.5)
+
+
+def _disk_buffer_sequential(job, settings, token, report, save, cache_dir):
+    """Download everything to the cache, then hand the job to the normal local paths.
+
+    Used for archives that need extracting and for multi-part sets. The job is rewritten
+    in place to point at the cached file(s) — mirroring what transfer_staged_archive does
+    — but WITHOUT deleting the cache here: Manager._report("complete") owns that, because
+    after this handoff the job finishes as an ordinary local job.
+    """
+    meter = Meter()
+    started = time.monotonic()
+    hist = [(started, 0, 0)]
+    deferred = ("sends to PS5 after extraction"
+                if job.get("kind") != "multipart" else "sends to PS5 once all parts are in")
+
+    if job.get("kind") == "multipart":
+        parts = list(job.get("parts") or [])
+        if not parts:
+            raise TransferError("No parts provided for this multi-part transfer.")
+        total_committed = 0
+        grand_total = 0
+        local_parts = []
+        probed = []
+        for entry in parts:
+            p_src = entry.get("source", "") if isinstance(entry, dict) else str(entry)
+            p_kind = (entry.get("kind") if isinstance(entry, dict) else None) or (
+                "url" if str(p_src).startswith(("http://", "https://")) else "local")
+            p_name = (entry.get("name") if isinstance(entry, dict) else "") or \
+                valid_name(os.path.basename(str(p_src)) or "part.bin")
+            probed.append((p_src, p_kind, p_name))
+            if p_kind == "url":
+                info = probe_source("url", p_src, token, decompress=False)
+                grand_total += info.size or 0
+        job["dl_total"] = grand_total or None
+        if grand_total:
+            job["total"] = grand_total
+        save()
+
+        for idx, (p_src, p_kind, p_name) in enumerate(probed):
+            if p_kind == "local":
+                local_parts.append({"kind": "local", "source": p_src, "name": p_name})
+                continue
+            part_file = os.path.join(cache_dir, valid_name(p_name))
+            info = probe_source("url", p_src, token, decompress=False)
+            dl_state = DownloadState(
+                total=info.size,
+                committed=os.path.getsize(part_file) if os.path.exists(part_file) else 0)
+            stop_event = threading.Event()
+            base = total_committed
+
+            def emit_dl(_base=base, _state=dl_state):
+                committed, _total, _d, _e = _state.snapshot()
+                report("dl_progress", {"transferred": _base + committed,
+                                       "total": job.get("dl_total")})
+
+            thread = threading.Thread(
+                target=_download_to_cache,
+                args=(info, part_file, settings, token, stop_event, dl_state, meter, emit_dl),
+                daemon=True, name="cache-downloader")
+            thread.start()
+            try:
+                got = _await_download(dl_state, token, report,
+                                      f"part {idx + 1}/{len(probed)}", emit_dl,
+                                      meter=meter, hist=hist, started=started,
+                                      settings=settings,
+                                      total_hint=job.get("dl_total"), after=deferred)
+            finally:
+                stop_event.set()
+                thread.join(timeout=10)
+            total_committed = base + got
+            local_parts.append({"kind": "local", "source": part_file, "name": p_name})
+
+        job["parts"] = local_parts
+    else:
+        source = probe_source(job["kind"], job["source"], token, decompress=False)
+        if not job.get("name") or "." not in job.get("name", ""):
+            job["name"] = source.filename or job.get("name") or "download.bin"
+        name = valid_name(job["name"])
+        cache_file = os.path.join(cache_dir, name)
+        job["dl_total"] = source.size
+        # Set the headline size immediately: until a progress event lands the monitor
+        # would otherwise read "0 KB of Unknown size".
+        if source.size:
+            job["total"] = source.size
+        save()
+
+        dl_state = DownloadState(
+            total=source.size,
+            committed=os.path.getsize(cache_file) if os.path.exists(cache_file) else 0)
+        stop_event = threading.Event()
+
+        def emit_dl():
+            committed, total, _d, _e = dl_state.snapshot()
+            report("dl_progress", {"transferred": committed, "total": total})
+
+        thread = threading.Thread(
+            target=_download_to_cache,
+            args=(source, cache_file, settings, token, stop_event, dl_state, meter, emit_dl),
+            daemon=True, name="cache-downloader")
+        thread.start()
+        try:
+            _await_download(dl_state, token, report, name, emit_dl, meter=meter,
+                            hist=hist, started=started, settings=settings,
+                            total_hint=source.size, after=deferred)
+        finally:
+            stop_event.set()
+            thread.join(timeout=10)
+
+        job["source_url"] = job.get("source", "")
+        job["source"] = cache_file
+        job["kind"] = "local"
+
+    # The source kind changed, so the stored fingerprint no longer matches; clearing it
+    # avoids transfer()'s "Source changed since this job started" guard.
+    job["identity"] = None
+    job["staged_extraction"] = bool(job.get("staged_extraction"))
+    save()
+    report("status", "Download complete · sending to PS5")
+    return transfer(job, settings, token, report, save)
+
+
+def transfer_disk_buffer(job, settings, token, report, save):
+    """Download to a local cache first, then upload — pipelined when the PS5 is up.
+
+    The download runs regardless of whether the console is reachable; the upload starts as
+    soon as it answers and streams from the still-growing cache file. The FTP lock is only
+    taken around the actual upload session so console browsing stays responsive while a
+    download or a wait is in progress.
+    """
+    cache_dir = job.get("cache_dir") or job_cache_dir(job, settings)
+    os.makedirs(cache_dir, exist_ok=True)
+    job["cache_dir"] = cache_dir
+
+    if _disk_buffer_needs_full_download(job):
+        return _disk_buffer_sequential(job, settings, token, report, save, cache_dir)
+
+    report("status", "Inspecting source for local download")
+    source = probe_source(job["kind"], job["source"], token, decompress=False)
+    if not job.get("name") or "." not in job.get("name", ""):
+        job["name"] = source.filename or job.get("name") or "download.bin"
+    name = valid_name(job["name"])
+    cache_file = os.path.join(cache_dir, name)
+
+    # Reuse an existing cache only when the source still looks identical.
+    meta = _read_cache_meta(cache_dir)
+    fresh_meta = _source_meta(source)
+    if meta and {k: meta.get(k) for k in fresh_meta} != fresh_meta:
+        report("status", "Source changed · restarting the local download")
+        try:
+            os.remove(cache_file)
+        except OSError:
+            pass
+        job["stage_owned"] = False
+    _write_cache_meta(cache_dir, fresh_meta)
+
+    if source.size:
+        existing = os.path.getsize(cache_file) if os.path.exists(cache_file) else 0
+        need = max(0, source.size - existing)
+        try:
+            free = shutil.disk_usage(cache_dir).free
+        except OSError:
+            free = None
+        if free is not None and need > free:
+            raise TransferError(
+                f"Not enough local disk space to cache this download: need "
+                f"{need/1e9:.1f} GB, {free/1e9:.1f} GB free in {cache_dir}.")
+
+    job["dl_total"] = source.size
+    save()
+
+    meter = Meter()
+    started = time.monotonic()
+    hist = [(started, 0, 0)]
+    dl_state = DownloadState(total=source.size,
+                             committed=os.path.getsize(cache_file) if os.path.exists(cache_file) else 0)
+    stop_event = threading.Event()
+
+    def emit_dl():
+        committed, total, _, _ = dl_state.snapshot()
+        report("dl_progress", {"transferred": committed, "total": total})
+
+    downloader = threading.Thread(
+        target=_download_to_cache,
+        args=(source, cache_file, settings, token, stop_event, dl_state, meter, emit_dl),
+        daemon=True, name="cache-downloader")
+    downloader.start()
+
+    ftp_lock = settings.get("_ftp_lock")
+    ftp = None
+    acquired = False
+    try:
+        # 1. Wait for the console, without holding the FTP lock.
+        waited = 0.0
+        while True:
+            token.check()
+            committed, total, done, error = dl_state.snapshot()
+            if error is not None:
+                raise error
+            if _ps5_reachable(settings):
+                break
+            pct = f"{committed * 100 // total}% downloaded" if total else f"{committed/1e9:.2f} GB downloaded"
+            state_txt = "Downloaded" if done else "Downloading to this PC"
+            report("status", f"{state_txt} · {pct} · waiting for PS5 to come online")
+            emit_dl()
+            now = time.monotonic()
+            snap = meter.snapshot()
+            _, down = windowed_rates(hist, now, snap)
+            report("progress", {
+                "transferred": 0,
+                "total": source.size or committed or 1,
+                "upload_bps": 0,
+                "download_bps": down,
+                "buffered": snap["buffered"],
+                "buffer_capacity": settings["buffer_mb"] * MIB,
+                "elapsed": now - started,
+                "eta": None,
+                "bottleneck": "Waiting for PS5",
+                "offset": 0,
+                "current_file": name,
+            })
+            token.wait(min(8.0, 2.0 + waited * 0.5))
+            waited = min(8.0, waited + 1.0)
+
+        # 2. Upload, streaming from the cache as it grows.
+        if ftp_lock is not None:
+            while not ftp_lock.acquire(timeout=0.5):
+                token.check()
+            acquired = True
+        report("status", "PS5 online · starting upload")
+        ftp = connect_ftp(settings, token)
+        folder = valid_folder(job.get("folder") or settings["folder"])
+        # Create the destination path if needed, exactly like the other upload paths.
+        try:
+            ensure_folder(ftp, folder)
+        except ftplib.error_perm as e:
+            raise TransferError(f"PS5 folder {folder} is not writable or could not be created.") from e
+
+        committed, total, done, error = dl_state.snapshot()
+        if error is not None:
+            raise error
+        tail_source = SourceInfo(
+            kind="tail_local",
+            location=cache_file,
+            size=source.size,
+            ranges=False,
+            etag=source.etag,
+            modified=source.modified,
+            filename=name,
+            original_url=job.get("source", ""),
+        )
+        up_settings = {**settings, "_dl_state": dl_state}
+        job["identity"] = None
+        expected = stream_file_to_ftp(ftp, tail_source, name, job, up_settings, token,
+                                      report, save, meter=meter, hist=hist, started=started)
+        job["transferred"] = expected
+        job["total"] = expected
+        # transfer() emits this for the ordinary paths; this path must do it itself or the
+        # job is never marked complete and the local cache is never reclaimed.
+        report("complete", {"size": expected,
+                            "verification": "Remote file size verified; not a cryptographic checksum."})
+        return expected
+    finally:
+        stop_event.set()
+        try:
+            downloader.join(timeout=10)
+        except Exception:
+            pass
+        if ftp:
+            close_ftp(ftp, token)
+        if acquired and ftp_lock is not None:
+            try:
+                ftp_lock.release()
+            except Exception:
+                pass
+
+
 def transfer(job, settings, token, report, save):
     """One transfer attempt. Partial files are uniquely owned by the persisted job ID."""
     if job.get("kind") == "folder":
         return transfer_folder(job, settings, token, report, save)
+
+    # Disk-buffer mode: cache locally first so the download can run with the console off.
+    # The guard on non-local parts stops the handoff-mutated job from re-entering here.
+    if job.get("disk_buffer") and (
+            job.get("kind") == "url"
+            or (job.get("kind") == "multipart"
+                and any(p.get("kind") != "local" for p in (job.get("parts") or [])))):
+        return transfer_disk_buffer(job, settings, token, report, save)
 
     report("status", "Inspecting source")
 

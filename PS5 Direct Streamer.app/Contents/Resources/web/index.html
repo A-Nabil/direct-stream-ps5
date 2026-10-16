@@ -243,9 +243,37 @@
             </div>
           </div>
 
-          <!-- Progress Bar Track -->
-          <div id="main-progress" class="progress-bar-track" role="progressbar" aria-label="Active transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-            <div id="progress-fill" class="progress-bar-fill" style="width: 0%;"></div>
+          <!-- Phase stack: each leg of the journey states its own case -->
+          <div id="phase-stack" class="phase-stack">
+
+            <!-- Leg 1 - fetch to this PC (disk-buffer jobs only) -->
+            <div id="phase-download" class="phase-row" hidden>
+              <div class="phase-head">
+                <span class="phase-step">1</span>
+                <span class="phase-route">Source <b>&rarr;</b> This PC</span>
+                <span id="phase-dl-state" class="phase-state">Idle</span>
+                <span id="phase-dl-pct" class="phase-pct">0%</span>
+              </div>
+              <div id="download-progress" class="phase-track" role="progressbar" aria-label="Download to this PC" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <div id="download-fill" class="phase-fill dl" style="width: 0%;"></div>
+              </div>
+              <div id="download-bytes" class="phase-meta">Waiting to start</div>
+            </div>
+
+            <!-- Leg 2 - send to the console -->
+            <div id="phase-upload" class="phase-row">
+              <div class="phase-head">
+                <span id="phase-up-step" class="phase-step">2</span>
+                <span class="phase-route">This PC <b>&rarr;</b> PS5</span>
+                <span id="phase-up-state" class="phase-state">Idle</span>
+                <span id="phase-up-pct" class="phase-pct">0%</span>
+              </div>
+              <div id="main-progress" class="phase-track" role="progressbar" aria-label="Active transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <div id="progress-fill" class="phase-fill up" style="width: 0%;"></div>
+              </div>
+              <div id="phase-up-meta" class="phase-meta">Waiting to start</div>
+            </div>
+
           </div>
 
           <details class="transfer-insights"><summary>Transfer insights <span>Speed, source & memory</span></summary>
@@ -1208,6 +1236,14 @@
         <label class="studio-checkbox-label">
           <input id="overwrite" type="checkbox">
           <span>Allow replacement of existing console file on size match</span>
+        </label>
+        <label id="disk-buffer-option" class="studio-checkbox-label">
+          <input id="disk-buffer" type="checkbox">
+          <span>Download to this PC first &mdash; starts even while the PS5 is off, then sends when it is online.<br><small style="opacity:.7">Plain .pkg/.iso files send while still downloading; archives that get extracted send once the download finishes.</small></span>
+        </label>
+        <label id="keep-local-option" class="studio-checkbox-label">
+          <input id="keep-local" type="checkbox">
+          <span>Keep the local copy after sending (otherwise it is deleted once verified)</span>
         </label>
         <label id="multipart-stitch-option" class="studio-checkbox-label">
           <input id="combine-multipart" type="checkbox" checked>
