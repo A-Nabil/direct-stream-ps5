@@ -1604,22 +1604,22 @@ function detectMultipartSequence(items) {
 let modalExtractMode = 'ps5';
 let lastEnabledExtractMode = 'ps5';
 
+const DEST_PRESETS = {
+  '/data/homebrew': 'Homebrew (/data/homebrew)',
+  '/data/ShadowMount': 'ShadowMount (Games & PFS Images)',
+  '/data/pkg': 'Packages (/data/pkg)',
+  '/mnt/usb0': 'USB drive (/mnt/usb0)',
+};
+
 function setDestPreset(dest) {
   const input = $('modal-dest-folder');
   const hint = $('dest-hint');
-  const buttons = document.querySelectorAll('.dest-preset-btn');
-  buttons.forEach(b => {
+  document.querySelectorAll('.dest-preset-btn').forEach(b => {
     b.classList.toggle('selected', b.dataset.dest === dest);
   });
-  if (dest === '/data/homebrew') {
-    if (input) input.value = '/data/homebrew';
-    if (hint) hint.textContent = 'Homebrew (/data/homebrew)';
-  } else if (dest === '/data/ShadowMount') {
-    if (input) input.value = '/data/ShadowMount';
-    if (hint) hint.textContent = 'ShadowMount (Games & PFS Images)';
-  } else if (dest === '/data/pkg') {
-    if (input) input.value = '/data/pkg';
-    if (hint) hint.textContent = 'Packages (/data/pkg)';
+  if (DEST_PRESETS[dest]) {
+    if (input) input.value = dest;
+    if (hint) hint.textContent = DEST_PRESETS[dest];
   } else if (dest === 'custom') {
     if (hint) hint.textContent = 'Custom console directory';
     input?.focus();
@@ -1634,21 +1634,12 @@ document.querySelectorAll('.dest-preset-btn').forEach(btn => {
 
 $('modal-dest-folder')?.addEventListener('input', e => {
   const val = e.target.value.trim();
-  const buttons = document.querySelectorAll('.dest-preset-btn');
+  const preset = DEST_PRESETS[val] ? val : 'custom';
+  document.querySelectorAll('.dest-preset-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.dest === preset);
+  });
   const hint = $('dest-hint');
-  if (val === '/data/homebrew') {
-    buttons.forEach(b => b.classList.toggle('selected', b.dataset.dest === '/data/homebrew'));
-    if (hint) hint.textContent = 'Homebrew (/data/homebrew)';
-  } else if (val === '/data/ShadowMount') {
-    buttons.forEach(b => b.classList.toggle('selected', b.dataset.dest === '/data/ShadowMount'));
-    if (hint) hint.textContent = 'ShadowMount (Games & PFS Images)';
-  } else if (val === '/data/pkg') {
-    buttons.forEach(b => b.classList.toggle('selected', b.dataset.dest === '/data/pkg'));
-    if (hint) hint.textContent = 'Packages (/data/pkg)';
-  } else {
-    buttons.forEach(b => b.classList.toggle('selected', b.dataset.dest === 'custom'));
-    if (hint) hint.textContent = 'Custom console directory';
-  }
+  if (hint) hint.textContent = DEST_PRESETS[val] || 'Custom console directory';
 });
 
 function setArchiveExtractMode(mode) {
