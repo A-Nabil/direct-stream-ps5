@@ -1,0 +1,70 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The gate. Linux is the clean environment: the suite shells out to tar and
+  # checks POSIX file modes, both of which behave normally here.
+  linux:
+    name: Python ${{ matrix.python }} on Ubuntu
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The app targets 3.9+; test the floor and a current release.
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Install unar
+        # Archive staging tests need an extraction tool. The bundled bin/unar is a
+        # macOS binary, so Linux needs the packaged one.
+        run: sudo apt-get update && sudo apt-get install -y unar
+
+      - name: Byte-compile every module
+        run: python -m compileall -q ps5_streamer.py transfer_core.py resolver.py zip_streamer.py browser_capture.py
+
+      - name: Run the test suite
+        run: python -m unittest discover -s tests -v
+
+  # Informational only. Four tests fail on Windows for environment reasons that
+  # have nothing to do with the code under test: Git Bash tar reads "C:\..." as a
+  # remote host, and NTFS has no POSIX 0o600 mode. Surfaced so regressions are
+  # still visible, but not allowed to block a PR.
+  windows:
+    name: Windows (informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run the test suite
+        run: python -m unittest discover -s tests

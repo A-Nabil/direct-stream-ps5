@@ -1,0 +1,74 @@
+name: Sensitive diff review
+
+# A pull request that changes authentication, the host allowlist, the CSP, network
+# binding or remote browser control must be looked at by a person. Automated
+# review tends to approve this class of change: the reviewer shares the author's
+# blind spots. This job fails such a PR until someone adds the
+# "security-reviewed" label, which is a deliberate human act.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    name: Flag security-sensitive changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Inspect the diff
+        id: scan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Added or removed lines only; context lines are not changes.
+          git diff "$BASE_SHA" "$HEAD_SHA" -- \
+            ':(exclude)PS5 Direct Streamer.app' ':(exclude)tests' \
+            ':(exclude)*.md' ':(exclude)docs/**' \
+            | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' > /tmp/changed.txt || true
+
+          PATTERN='allowed_hosts|Content-Security-Policy|unsafe-inline|server\.token|session_token|ps5_session|secrets\.token|0\.0\.0\.0|--remote-debugging-port|remote_input|Runtime\.evaluate|Page\.navigate|compare_digest|os\.environ\.get\(.DS5_'
+
+          if grep -nE "$PATTERN" /tmp/changed.txt > /tmp/hits.txt; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "### Security-sensitive lines in this diff" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -40 /tmp/hits.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No security-sensitive lines changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Require a human sign-off
+        if: steps.scan.outputs.found == 'true'
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if [[ ",$LABELS," == *",security-reviewed,"* ]]; then
+            echo "Labelled security-reviewed — a person has signed this off."
+            exit 0
+          fi
+          cat <<'EOF'
+          This PR changes authentication, the host allowlist, the CSP, network binding
+          or remote browser control.
+
+          Those controls are easy to weaken by accident and automated review rarely
+          catches it. Examples this check exists for:
+            - replacing a per-start random session token with a fixed value
+            - adding entries to allowed_hosts (the DNS-rebinding guard)
+            - relaxing the CSP
+            - exposing remote input to a real browser
+
+          Read the flagged lines in the job summary. If the change is intended, add the
+          "security-reviewed" label to this PR and re-run.
+          EOF
+          exit 1
