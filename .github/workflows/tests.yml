@@ -46,14 +46,15 @@ jobs:
       - name: Run the test suite
         run: python -m unittest discover -s tests -v
 
-  # Informational only. Four tests fail on Windows for environment reasons that
-  # have nothing to do with the code under test: Git Bash tar reads "C:\..." as a
-  # remote host, and NTFS has no POSIX 0o600 mode. Surfaced so regressions are
-  # still visible, but not allowed to block a PR.
+  # Windows is a real check, not a rubber stamp. Four tests fail there for
+  # environment reasons unrelated to the code -- Git Bash tar reads a Windows
+  # drive path as a remote host, and NTFS has no POSIX 0o600 mode -- so this
+  # job accepts exactly those four and fails on anything else. Marking the
+  # whole job informational instead would have hidden every real Windows
+  # regression behind a permanently red tick nobody reads.
   windows:
-    name: Windows (informational)
+    name: Windows
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -67,4 +68,35 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run the test suite
-        run: python -m unittest discover -s tests
+        shell: bash
+        run: |
+          python -m unittest discover -s tests 2>&1 | tee /tmp/out.txt || true
+
+          # "FAIL: name (module.Class.name)" -> "module.Class.name"
+          grep -E '^(FAIL|ERROR): ' /tmp/out.txt > /tmp/lines.txt || true
+          sed -E 's/^[A-Z]+: [^(]*\(([^)]*)\).*/\1/' /tmp/lines.txt | sort -u > /tmp/got.txt
+
+          cat > /tmp/known_raw.txt <<'KNOWN'
+          test_transfer.Integration.test_queue_restart_recovery
+          test_transfer.Integration.test_transfer_staged_archive_multipart
+          test_transfer.Integration.test_transfer_staged_archive_url_zip
+          test_zip_streamer.TestZipStreamer.test_tar_archive_extraction_pipeline
+          KNOWN
+          sed -E 's/^ +//' /tmp/known_raw.txt | sort -u > /tmp/known.txt
+
+          comm -23 /tmp/got.txt /tmp/known.txt > /tmp/new.txt
+
+          if [ ! -s /tmp/new.txt ]; then
+            echo "No failures beyond the four known Windows environment ones." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Windows failures that are not environment noise"
+            echo ''
+            echo 'These are not on the known-failure list, so treat them as regressions:'
+            echo '```'
+            cat /tmp/new.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
