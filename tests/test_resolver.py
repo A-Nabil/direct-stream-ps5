@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from resolver import (
     pre_resolve_url,
     extract_download_link_from_html,
@@ -554,3 +555,19 @@ class TestResolver(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class UsbDestinationTests(unittest.TestCase):
+    def test_usb_mount_is_an_accepted_destination(self):
+        from transfer_core import valid_folder
+        self.assertEqual(valid_folder("/mnt/usb0"), "/mnt/usb0")
+        self.assertEqual(valid_folder("/mnt/usb0/"), "/mnt/usb0")
+
+    def test_destination_picker_offers_usb(self):
+        html = (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text()
+        self.assertIn('data-dest="/mnt/usb0"', html)
+
+    def test_usb_destination_shows_an_attach_warning(self):
+        root = Path(__file__).resolve().parents[1] / "web"
+        self.assertIn('id="dest-usb-warning"', (root / "index.html").read_text())
+        self.assertIn("updateDestWarning", (root / "app.js").read_text())
