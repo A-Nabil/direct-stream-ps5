@@ -569,9 +569,20 @@ class Integration(unittest.TestCase):
         self.assertTrue(info['resumable'])
 
     def test_find_unar_tool(self):
+        import subprocess
         tool = find_unar_tool()
-        self.assertIsNotNone(tool, "unar executable must be discoverable")
+        if tool is None:
+            self.skipTest("no unar on this machine")
         self.assertTrue(Path(tool).is_file())
+        # It must actually run here. The bundled copy is a macOS arm64 binary
+        # and used to be returned on Linux and Windows too, where os.access
+        # says executable and exec then fails -- which is how a working system
+        # unar on PATH ended up ignored.
+        try:
+            subprocess.run([tool, "-v"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30)
+        except OSError as ex:
+            self.fail(f"find_unar_tool() returned {tool}, which cannot run here: {ex}")
 
     def test_find_extracted_payload(self):
         import shutil
@@ -808,7 +819,11 @@ class Integration(unittest.TestCase):
                 m.add_jobs({"items": [{"source": "http://127.0.0.1:1/failing_test.pkg"}]})
                 job = m.jobs[0]
                 m.action("start")
-                deadline = time.monotonic() + 5
+                # The job retries with backoff before giving up, so 5s was not
+                # always enough on a loaded machine and this test failed
+                # intermittently. The loop exits as soon as the state settles,
+                # so a longer ceiling costs nothing in the normal case.
+                deadline = time.monotonic() + 60
                 while job["state"] in ("queued", "starting", "running", "retrying") and time.monotonic() < deadline:
                     time.sleep(0.05)
 
@@ -850,8 +865,14 @@ class Integration(unittest.TestCase):
             pass
 
         tok = StopToken()
+        # The subject here is the storage preflight, not tool discovery, and
+        # the preflight runs after the unar lookup -- so stand a tool in on
+        # machines that have none. (This test used to pass on Windows only
+        # because the lookup returned the bundled macOS binary, which cannot
+        # run there and was never reached.)
         # Mock disk usage to return only 1 MB free space
-        with unittest.mock.patch("shutil.disk_usage", return_value=unittest.mock.Mock(free=1024 * 1024)):
+        with unittest.mock.patch("transfer_core.find_unar_tool", return_value="unar"), \
+             unittest.mock.patch("shutil.disk_usage", return_value=unittest.mock.Mock(free=1024 * 1024)):
             with self.assertRaises(TransferError) as ctx:
                 transfer_staged_archive(job, self.cfg, tok, report, save)
             self.assertIn("Insufficient Mac storage for local extraction", str(ctx.exception))

@@ -14,6 +14,7 @@ import socket
 import ssl
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1522,23 +1523,34 @@ def transfer_folder(job, settings, token, report, save):
 
 
 def find_unar_tool():
-    """Find the path to the unar CLI executable (bundled in app, local bin, or PATH)."""
-    # 1. Bundled inside macOS .app Resources/bin
-    res_dir = os.environ.get("RESOURCEPATH")
-    if res_dir:
-        p = os.path.join(res_dir, "bin", "unar")
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
+    """Find the path to the unar CLI executable (bundled in app, local bin, or PATH).
 
-    # 2. Workspace / repository relative bin/unar or App bundle bin/unar
-    base = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base, "bin", "unar"),
-        os.path.join(base, "PS5 Direct Streamer.app", "Contents", "Resources", "bin", "unar"),
-        os.path.join(os.path.dirname(base), "Resources", "bin", "unar"),
-        "/opt/homebrew/bin/unar",
-        "/usr/local/bin/unar",
-    ]
+    The bundled copies are macOS (Mach-O arm64) builds, so they are only
+    considered on macOS. Elsewhere os.access(X_OK) still says yes -- the file
+    is present and carries the executable bit -- and the failure only surfaces
+    at exec time as "Exec format error" on Linux or WinError 193 on Windows,
+    with a perfectly good system unar sitting on PATH unused.
+    """
+    candidates = []
+
+    if sys.platform == "darwin":
+        # 1. Bundled inside macOS .app Resources/bin
+        res_dir = os.environ.get("RESOURCEPATH")
+        if res_dir:
+            candidates.append(os.path.join(res_dir, "bin", "unar"))
+
+        # 2. Workspace / repository relative bin/unar or App bundle bin/unar
+        base = os.path.dirname(os.path.abspath(__file__))
+        candidates += [
+            os.path.join(base, "bin", "unar"),
+            os.path.join(base, "PS5 Direct Streamer.app", "Contents", "Resources", "bin", "unar"),
+            os.path.join(os.path.dirname(base), "Resources", "bin", "unar"),
+            "/opt/homebrew/bin/unar",
+        ]
+
+    if os.name != "nt":
+        candidates.append("/usr/local/bin/unar")
+
     for c in candidates:
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c

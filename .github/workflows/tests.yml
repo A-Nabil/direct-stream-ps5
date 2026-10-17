@@ -46,10 +46,10 @@ jobs:
       - name: Run the test suite
         run: python -m unittest discover -s tests -v
 
-  # Windows is a real check, not a rubber stamp. Four tests fail there for
+  # Windows is a real check, not a rubber stamp. Two tests fail there for
   # environment reasons unrelated to the code -- Git Bash tar reads a Windows
   # drive path as a remote host, and NTFS has no POSIX 0o600 mode -- so this
-  # job accepts exactly those four and fails on anything else. Marking the
+  # job accepts exactly those two and fails on anything else. Marking the
   # whole job informational instead would have hidden every real Windows
   # regression behind a permanently red tick nobody reads.
   windows:
@@ -78,8 +78,6 @@ jobs:
 
           cat > /tmp/known_raw.txt <<'KNOWN'
           test_transfer.Integration.test_queue_restart_recovery
-          test_transfer.Integration.test_transfer_staged_archive_multipart
-          test_transfer.Integration.test_transfer_staged_archive_url_zip
           test_zip_streamer.TestZipStreamer.test_tar_archive_extraction_pipeline
           KNOWN
           sed -E 's/^ +//' /tmp/known_raw.txt | sort -u > /tmp/known.txt
@@ -87,7 +85,7 @@ jobs:
           comm -23 /tmp/got.txt /tmp/known.txt > /tmp/new.txt
 
           if [ ! -s /tmp/new.txt ]; then
-            echo "No failures beyond the four known Windows environment ones." >> "$GITHUB_STEP_SUMMARY"
+            echo "No failures beyond the known Windows environment ones." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
