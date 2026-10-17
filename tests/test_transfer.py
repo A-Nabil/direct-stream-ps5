@@ -568,6 +568,21 @@ class Integration(unittest.TestCase):
         self.assertTrue(info['ranges'])
         self.assertTrue(info['resumable'])
 
+    def test_unar_command_keeps_nq_to_macos(self):
+        import transfer_core
+        # -nq only exists in the macOS build. Passing it to Debian's unar
+        # exits 1 with "Unknown option -nq.", which the caller reports as a
+        # failed extraction -- so it reads like a corrupt archive.
+        with unittest.mock.patch.object(transfer_core.sys, "platform", "darwin"):
+            self.assertIn("-nq", transfer_core.unar_command("unar", "/tmp/out"))
+        for plat in ("linux", "win32"):
+            with unittest.mock.patch.object(transfer_core.sys, "platform", plat):
+                cmd = transfer_core.unar_command("unar", "/tmp/out")
+            self.assertNotIn("-nq", cmd, plat)
+            # Everything else must survive: -f overwrites, -k skip keeps
+            # going past an unreadable entry, -o picks the destination.
+            self.assertEqual(cmd, ["unar", "-q", "-f", "-k", "skip", "-o", "/tmp/out"])
+
     def test_find_unar_tool(self):
         import subprocess
         tool = find_unar_tool()

@@ -1522,6 +1522,20 @@ def transfer_folder(job, settings, token, report, save):
         close_ftp(ftp, token, clean)
 
 
+def unar_command(unar_bin, extract_dir):
+    """The unar argument list, minus the archive itself.
+
+    -nq (no quarantine) clears the macOS "downloaded from the internet"
+    xattr and only exists in the macOS build. Debian's unar exits 1 with
+    "Unknown option -nq.", which read as a corrupt archive rather than as
+    the wrong flag.
+    """
+    cmd = [unar_bin, "-q", "-f"]
+    if sys.platform == "darwin":
+        cmd.append("-nq")
+    return cmd + ["-k", "skip", "-o", extract_dir]
+
+
 def find_unar_tool():
     """Find the path to the unar CLI executable (bundled in app, local bin, or PATH).
 
@@ -1990,7 +2004,7 @@ def transfer_staged_archive(job, settings, token, report, save):
             or ""
         )
 
-        cmd = [unar_bin, "-q", "-f", "-nq", "-k", "skip", "-o", extract_dir]
+        cmd = unar_command(unar_bin, extract_dir)
         if pwd:
             cmd.extend(["-p", pwd])
         cmd.append(archive_path)
