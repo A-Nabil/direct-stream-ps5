@@ -7,6 +7,7 @@ degrading the app.
 """
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -21,7 +22,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from browser_capture import CaptureSession, is_payload_name, site_of  # noqa: E402
-from ps5_streamer import Handler, Manager, build_allowed_hosts  # noqa: E402
+from ps5_streamer import (Handler, Manager, MIN_SESSION_TOKEN,  # noqa: E402
+                          build_allowed_hosts, extra_hosts_from_env,
+                          session_token_from_env)
 from transfer_core import (StopToken, TransferError, declared_total_size,  # noqa: E402
                            probe_source)
 
@@ -425,6 +428,49 @@ class DashboardHeaderTests(unittest.TestCase):
         self.assertEqual(hosts, {"127.0.0.1:8799", "localhost:8799", "[::1]:8799"})
         self.assertIn("192.168.1.10:8799", build_allowed_hosts(8799, "192.168.1.10"))
 
+
+    def test_extra_hosts_from_env_strips_entries(self):
+        # "pi.local, 192.168.1.5" would otherwise register " 192.168.1.5:PORT",
+        # which no Host header can equal -- a 403 with nothing to explain it.
+        with mock.patch.dict(os.environ, {"DS5_HOSTS": "pi.local, 192.168.1.5 ,, "}):
+            self.assertEqual(extra_hosts_from_env(8799),
+                             {"pi.local:8799", "192.168.1.5:8799"})
+
+    def test_extra_hosts_from_env_is_empty_when_unset(self):
+        for value in ("", "   ", ",,,"):
+            with mock.patch.dict(os.environ, {"DS5_HOSTS": value}):
+                self.assertEqual(extra_hosts_from_env(8799), set(), repr(value))
+
+    def test_unset_token_is_random_and_long(self):
+        env = dict(os.environ)
+        env.pop("DS5_TOKEN", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            first, second = session_token_from_env(), session_token_from_env()
+        self.assertNotEqual(first, second)
+        self.assertGreaterEqual(len(first), 32)
+
+    def test_a_fixed_token_is_accepted(self):
+        # The point of DS5_TOKEN: a bookmarked dashboard URL that survives a
+        # restart on a headless box.
+        token = "x" * MIN_SESSION_TOKEN
+        with mock.patch.dict(os.environ, {"DS5_TOKEN": token}):
+            self.assertEqual(session_token_from_env(), token)
+
+    def test_a_short_token_is_refused_at_startup(self):
+        # It is the whole of the authentication: nothing else stands between a
+        # caller and the queue, the FTP credentials or the capture browser.
+        for weak in ("pi", "1234", "x" * (MIN_SESSION_TOKEN - 1)):
+            with mock.patch.dict(os.environ, {"DS5_TOKEN": weak}):
+                with self.assertRaises(SystemExit, msg=weak):
+                    session_token_from_env()
+
+    def test_a_non_ascii_token_is_refused_at_startup(self):
+        # secrets.compare_digest raises TypeError on non-ASCII strings, so this
+        # would turn every signed-in request into a 500 that reads as a server
+        # bug rather than a bad setting.
+        with mock.patch.dict(os.environ, {"DS5_TOKEN": "töken" + "x" * 20}):
+            with self.assertRaises(SystemExit):
+                session_token_from_env()
 
 class VerifyPayloadTests(unittest.TestCase):
     """verify_links must hand the UI what it needs to offer browser capture."""
