@@ -481,7 +481,7 @@ class RemoteViewTests(unittest.TestCase):
         self.assertEqual((params["x"], params["y"]), (0, 5000))
 
     def test_input_is_ignored_unless_capture_is_waiting(self):
-        for state in ("idle", "done", "failed"):
+        for state in ("starting", "done", "error", "cancelled"):
             session = self._session(state)
             with mock.patch.object(session, "_remote_call") as call:
                 session.remote_input({"type": "click", "x": 1, "y": 1})
@@ -512,7 +512,7 @@ class RemoteViewTests(unittest.TestCase):
 
     def test_frame_requires_an_active_capture(self):
         with self.assertRaises(RuntimeError):
-            self._session("idle").remote_frame()
+            self._session("cancelled").remote_frame()
 
     def test_frame_returns_the_screenshot_with_viewport_size(self):
         session = self._session()
