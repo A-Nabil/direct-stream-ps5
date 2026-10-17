@@ -1144,6 +1144,17 @@ class Manager:
             session = self.captures.get(sid)
         if not session:
             raise TransferError("That capture session is no longer active. Start it again.")
+        if action == "frame":
+            try:
+                return {"ok": True, "id": sid, **session.remote_frame(), **session.snapshot()}
+            except Exception as ex:
+                raise TransferError(f"Live view unavailable: {ex}")
+        if action == "input":
+            try:
+                session.remote_input(data.get("event") or {})
+            except Exception as ex:
+                raise TransferError(f"Input failed: {ex}")
+            return {"ok": True, "id": sid, **session.snapshot()}
         if action == "cancel":
             session.cancel()
         elif action != "status":
@@ -1563,6 +1574,53 @@ class Manager:
         self.save()
 
 
+MIN_SESSION_TOKEN = 16
+
+
+def session_token_from_env():
+    """The dashboard session token: DS5_TOKEN when set, else a fresh random one.
+
+    A fixed token is what lets a bookmarked dashboard URL survive a restart on
+    a headless box. It is also the entirety of the authentication, so a bad one
+    is refused at startup rather than accepted quietly:
+
+    - non-ASCII would make secrets.compare_digest raise TypeError, turning
+      every signed-in request into a 500 that looks like a server bug;
+    - a short value is guessable, and nothing else stands between a caller and
+      the queue, the FTP credentials or the capture browser.
+    """
+    raw = os.environ.get("DS5_TOKEN") or ""
+    if not raw:
+        return secrets.token_urlsafe(32)
+    try:
+        raw.encode("ascii")
+    except UnicodeEncodeError:
+        raise SystemExit(
+            "DS5_TOKEN must contain ASCII characters only, otherwise every "
+            "signed-in request fails with a 500.")
+    if len(raw) < MIN_SESSION_TOKEN:
+        raise SystemExit(
+            f"DS5_TOKEN must be at least {MIN_SESSION_TOKEN} characters: it is "
+            "the only thing protecting the dashboard. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+    return raw
+
+
+def extra_hosts_from_env(port):
+    """Additional Host header values from DS5_HOSTS, a comma separated list.
+
+    Entries are stripped: "pi.local, 192.168.1.5" would otherwise register
+    " 192.168.1.5:PORT", which no Host header can ever equal, and the symptom
+    is a 403 with nothing to explain it.
+    """
+    hosts = set()
+    for name in os.environ.get("DS5_HOSTS", "").split(","):
+        name = name.strip()
+        if name:
+            hosts.add(f"{name}:{port}")
+    return hosts
+
+
 def build_allowed_hosts(port, extra_host=None):
     """Host header values the dashboard will answer to.
 
@@ -1838,9 +1896,10 @@ def main():
         return
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
-    server.token = secrets.token_urlsafe(32)
+    server.token = session_token_from_env()
     server.manager = Manager(directory)
     server.allowed_hosts = build_allowed_hosts(server.server_port)
+    server.allowed_hosts |= extra_hosts_from_env(server.server_port)
     
     local_url = f"http://127.0.0.1:{server.server_port}/#session={server.token}"
     if args.host == "0.0.0.0":

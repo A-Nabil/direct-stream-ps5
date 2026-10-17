@@ -7,6 +7,7 @@ degrading the app.
 """
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -21,7 +22,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from browser_capture import CaptureSession, is_payload_name, site_of  # noqa: E402
-from ps5_streamer import Handler, Manager, build_allowed_hosts  # noqa: E402
+from ps5_streamer import (Handler, Manager, MIN_SESSION_TOKEN,  # noqa: E402
+                          build_allowed_hosts, extra_hosts_from_env,
+                          session_token_from_env)
 from transfer_core import (StopToken, TransferError, declared_total_size,  # noqa: E402
                            probe_source)
 
@@ -426,6 +429,49 @@ class DashboardHeaderTests(unittest.TestCase):
         self.assertIn("192.168.1.10:8799", build_allowed_hosts(8799, "192.168.1.10"))
 
 
+    def test_extra_hosts_from_env_strips_entries(self):
+        # "pi.local, 192.168.1.5" would otherwise register " 192.168.1.5:PORT",
+        # which no Host header can equal -- a 403 with nothing to explain it.
+        with mock.patch.dict(os.environ, {"DS5_HOSTS": "pi.local, 192.168.1.5 ,, "}):
+            self.assertEqual(extra_hosts_from_env(8799),
+                             {"pi.local:8799", "192.168.1.5:8799"})
+
+    def test_extra_hosts_from_env_is_empty_when_unset(self):
+        for value in ("", "   ", ",,,"):
+            with mock.patch.dict(os.environ, {"DS5_HOSTS": value}):
+                self.assertEqual(extra_hosts_from_env(8799), set(), repr(value))
+
+    def test_unset_token_is_random_and_long(self):
+        env = dict(os.environ)
+        env.pop("DS5_TOKEN", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            first, second = session_token_from_env(), session_token_from_env()
+        self.assertNotEqual(first, second)
+        self.assertGreaterEqual(len(first), 32)
+
+    def test_a_fixed_token_is_accepted(self):
+        # The point of DS5_TOKEN: a bookmarked dashboard URL that survives a
+        # restart on a headless box.
+        token = "x" * MIN_SESSION_TOKEN
+        with mock.patch.dict(os.environ, {"DS5_TOKEN": token}):
+            self.assertEqual(session_token_from_env(), token)
+
+    def test_a_short_token_is_refused_at_startup(self):
+        # It is the whole of the authentication: nothing else stands between a
+        # caller and the queue, the FTP credentials or the capture browser.
+        for weak in ("pi", "1234", "x" * (MIN_SESSION_TOKEN - 1)):
+            with mock.patch.dict(os.environ, {"DS5_TOKEN": weak}):
+                with self.assertRaises(SystemExit, msg=weak):
+                    session_token_from_env()
+
+    def test_a_non_ascii_token_is_refused_at_startup(self):
+        # secrets.compare_digest raises TypeError on non-ASCII strings, so this
+        # would turn every signed-in request into a 500 that reads as a server
+        # bug rather than a bad setting.
+        with mock.patch.dict(os.environ, {"DS5_TOKEN": "töken" + "x" * 20}):
+            with self.assertRaises(SystemExit):
+                session_token_from_env()
+
 class VerifyPayloadTests(unittest.TestCase):
     """verify_links must hand the UI what it needs to offer browser capture."""
 
@@ -452,3 +498,86 @@ class VerifyPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Remote live view
+# ---------------------------------------------------------------------------
+
+class RemoteViewTests(unittest.TestCase):
+    def _session(self, state="waiting"):
+        session = CaptureSession("https://host.tld/f/abc")
+        session.state = state
+        return session
+
+    def test_click_is_a_move_press_release_sequence(self):
+        session = self._session()
+        with mock.patch.object(session, "_remote_call") as call:
+            session.remote_input({"type": "click", "x": 120, "y": 340})
+        types = [c.args[1]["type"] for c in call.call_args_list]
+        self.assertEqual(types, ["mouseMoved", "mousePressed", "mouseReleased"])
+        self.assertEqual(call.call_args_list[1].args[1]["x"], 120)
+        self.assertEqual(call.call_args_list[1].args[1]["y"], 340)
+
+    def test_click_coordinates_are_clamped(self):
+        session = self._session()
+        with mock.patch.object(session, "_remote_call") as call:
+            session.remote_input({"type": "click", "x": -50, "y": 10 ** 9})
+        params = call.call_args_list[1].args[1]
+        self.assertEqual((params["x"], params["y"]), (0, 5000))
+
+    def test_input_is_ignored_unless_capture_is_waiting(self):
+        for state in ("starting", "done", "error", "cancelled"):
+            session = self._session(state)
+            with mock.patch.object(session, "_remote_call") as call:
+                session.remote_input({"type": "click", "x": 1, "y": 1})
+            self.assertFalse(call.called, state)
+
+    def test_text_is_truncated_and_empty_text_is_dropped(self):
+        session = self._session()
+        with mock.patch.object(session, "_remote_call") as call:
+            session.remote_input({"type": "text", "text": "a" * 500})
+            session.remote_input({"type": "text", "text": ""})
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(len(call.call_args.args[1]["text"]), 200)
+
+    def test_only_known_special_keys_are_forwarded(self):
+        session = self._session()
+        with mock.patch.object(session, "_remote_call") as call:
+            session.remote_input({"type": "key", "key": "F12"})
+            session.remote_input({"type": "key", "key": "Enter"})
+        self.assertEqual([c.args[1]["type"] for c in call.call_args_list],
+                         ["keyDown", "keyUp"])
+        self.assertEqual(call.call_args_list[0].args[1]["text"], "\r")
+
+    def test_wheel_delta_is_clamped(self):
+        session = self._session()
+        with mock.patch.object(session, "_remote_call") as call:
+            session.remote_input({"type": "wheel", "x": 5, "y": 5, "dy": 99999})
+        self.assertEqual(call.call_args.args[1]["deltaY"], 3000)
+
+    def test_frame_requires_an_active_capture(self):
+        with self.assertRaises(RuntimeError):
+            self._session("cancelled").remote_frame()
+
+    def test_frame_returns_the_screenshot_with_viewport_size(self):
+        session = self._session()
+        with mock.patch.object(session, "_remote_call", return_value={"data": "QUJD"}) as call:
+            out = session.remote_frame()
+        self.assertEqual(out["frame"], "QUJD")
+        self.assertEqual((out["width"], out["height"]), (1100, 860))
+        self.assertEqual(call.call_args.args[0], "Page.captureScreenshot")
+
+    def test_virtual_display_gives_up_when_xvfb_never_comes_up(self):
+        session = self._session()
+        with mock.patch("browser_capture.shutil.which", return_value="/usr/bin/Xvfb"), \
+             mock.patch("browser_capture.os.path.exists", return_value=False), \
+             mock.patch("browser_capture.time.sleep"), \
+             mock.patch("browser_capture.subprocess.Popen") as popen:
+            popen.return_value.poll.return_value = None
+            self.assertIsNone(session._start_virtual_display())
+        self.assertEqual(popen.call_count, 1)
+
+    def test_virtual_display_is_skipped_without_xvfb(self):
+        with mock.patch("browser_capture.shutil.which", return_value=None):
+            self.assertIsNone(self._session()._start_virtual_display())

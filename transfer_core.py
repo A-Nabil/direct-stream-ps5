@@ -132,6 +132,9 @@ def valid_folder(value):
     return posixpath.normpath(value)
 
 
+URL_SAFE = "/%:@!$&'()*+,;=-._~"
+
+
 def valid_url(value):
     value = safe_text(value, "download URL", 16384)
     try:
@@ -139,9 +142,16 @@ def valid_url(value):
         if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
             raise ValueError()
         _ = p.port
+        # Percent-encode spaces and other unsafe characters (existing %XX is kept)
+        # so names like "Game (USA) v1.pkg" don't make http.client reject the request.
+        value = urllib.parse.urlunsplit((
+            p.scheme, p.netloc,
+            urllib.parse.quote(p.path, safe=URL_SAFE),
+            urllib.parse.quote(p.query, safe=URL_SAFE + "?"),
+            p.fragment))
         value.encode("ascii")
     except (ValueError, UnicodeError):
-        raise TransferError("Use an HTTP or HTTPS direct link (URL-encode spaces and non-ASCII characters).")
+        raise TransferError("Use an HTTP or HTTPS direct link.")
     return value
 
 
@@ -2525,6 +2535,7 @@ def transfer_ps5_remote_archive(job, settings, token, report, save,
                 extract_done = False
                 extract_failed = False
                 done_by_hint = False
+                normalize_issue = ""
                 failure_reason = ""
                 extracted_title_id = ""
                 extracted_final_path = ""
@@ -2566,7 +2577,7 @@ def transfer_ps5_remote_archive(job, settings, token, report, save,
                         # Extract result line: code=0 is success, non-zero is error
                         if "extract_result" in line:
                             m_code = re.search(r"code=(\d+)", line)
-                            m_reason = re.search(r"reason=([^\s]+)", line)
+                            m_reason = re.search(r"reason=(.+?)(?=\s+\w+=|$)", line)
                             code = int(m_code.group(1)) if m_code else -1
                             reason = m_reason.group(1) if m_reason else "unknown"
                             if code == 0 or reason == "success":
@@ -2585,6 +2596,7 @@ def transfer_ps5_remote_archive(job, settings, token, report, save,
                         # Normalization issue (archive unpacked fine, but title id path needs Python move)
                         if line.startswith("normalize_error"):
                             extract_done = True
+                            normalize_issue = line
                             break
 
                         # Hard errors
@@ -2739,6 +2751,20 @@ def transfer_ps5_remote_archive(job, settings, token, report, save,
                             pass
                 except Exception:
                     pass
+
+                # The payload could not place the files (e.g. a PS4 .pkg with no
+                # sce_sys/param.json): if anything is still staged, the game was
+                # not installed, so say so instead of reporting success.
+                if normalize_issue:
+                    left = []
+                    try:
+                        ftp.retrlines(f"LIST {stage_dir}", left.append)
+                    except Exception:
+                        left = []
+                    if any(l.split(None, 8)[-1] not in (".", "..") for l in left if l.strip()):
+                        raise TransferError(
+                            f"Extracted but not installed: {normalize_issue} "
+                            f"The files are in {stage_dir} on the PS5.")
 
                 # Clean up all uploaded parts if delete_after is enabled
                 if del_after:
