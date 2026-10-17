@@ -834,17 +834,25 @@ class Integration(unittest.TestCase):
                 m.add_jobs({"items": [{"source": "http://127.0.0.1:1/failing_test.pkg"}]})
                 job = m.jobs[0]
                 m.action("start")
-                # The job retries with backoff before giving up, so 5s was not
-                # always enough on a loaded machine and this test failed
-                # intermittently. The loop exits as soon as the state settles,
-                # so a longer ceiling costs nothing in the normal case.
+                # Read under the manager lock, and take a snapshot to assert
+                # against. The worker sets state, then detail, then error_info
+                # in one locked block; polling the live dict without the lock
+                # caught it mid-update, so the job was already "failed" while
+                # error_info was still a few statements away. That made this
+                # test fail roughly one run in three.
                 deadline = time.monotonic() + 60
-                while job["state"] in ("queued", "starting", "running", "retrying") and time.monotonic() < deadline:
+                snap = None
+                while time.monotonic() < deadline:
+                    with m.lock:
+                        if job["state"] not in ("queued", "starting", "running", "retrying"):
+                            snap = dict(job)
+                            break
                     time.sleep(0.05)
 
-                self.assertEqual(job["state"], "failed")
-                self.assertIn("error_info", job)
-                err = job["error_info"]
+                self.assertIsNotNone(snap, "job never settled")
+                self.assertEqual(snap["state"], "failed")
+                self.assertIn("error_info", snap)
+                err = snap["error_info"]
                 self.assertIsNotNone(err)
                 self.assertIn("traceback", err)
                 self.assertIn("summary", err)
